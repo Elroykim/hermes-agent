@@ -507,6 +507,76 @@ def _redact_approval_command(cmd: "str | None") -> str:
     return redact_sensitive_text(str(cmd or ""), force=True)
 
 
+def _send_exec_approval_or_text_sync(
+    *,
+    adapter: Any,
+    chat_id: str,
+    command: str,
+    session_key: str,
+    description: str,
+    metadata: Optional[Dict[str, Any]],
+    loop: asyncio.AbstractEventLoop,
+) -> None:
+    """Synchronously deliver a gateway approval prompt from an agent thread.
+
+    The approval wait in ``tools.approval`` treats a returned notify callback as
+    "the user was asked". Therefore this bridge must raise when both the rich
+    button prompt and the plain-text fallback fail; otherwise the agent blocks
+    until timeout on an approval request that never reached Slack/Discord/etc.
+    """
+
+    if getattr(type(adapter), "send_exec_approval", None) is not None:
+        try:
+            approval_fut = safe_schedule_threadsafe(
+                adapter.send_exec_approval(
+                    chat_id=chat_id,
+                    command=command,
+                    session_key=session_key,
+                    description=description,
+                    metadata=metadata,
+                ),
+                loop,
+                logger=logger,
+                log_message="send_exec_approval scheduling error",
+            )
+            if approval_fut is None:
+                raise RuntimeError("send_exec_approval: loop unavailable")
+            approval_result = approval_fut.result(timeout=15)
+            if getattr(approval_result, "success", False):
+                return
+            logger.warning(
+                "Button-based approval failed (send returned error), falling back to text: %s",
+                getattr(approval_result, "error", None),
+            )
+        except Exception as exc:
+            logger.warning(
+                "Button-based approval failed, falling back to text: %s", exc
+            )
+
+    prefix = getattr(adapter, "typed_command_prefix", "/")
+    cmd_preview = command[:200] + "..." if len(command) > 200 else command
+    msg = (
+        f"⚠️ **Dangerous command requires approval:**\n"
+        f"```\n{cmd_preview}\n```\n"
+        f"Reason: {description}\n\n"
+        f"Reply `{prefix}approve` to execute, `{prefix}approve session` to approve this pattern "
+        f"for the session, `{prefix}approve always` to approve permanently, or `{prefix}deny` to cancel."
+    )
+    send_fut = safe_schedule_threadsafe(
+        adapter.send(chat_id, msg, metadata=metadata),
+        loop,
+        logger=logger,
+        log_message="Approval text-send scheduling error",
+    )
+    if send_fut is None:
+        raise RuntimeError("approval text-send: loop unavailable")
+    send_result = send_fut.result(timeout=15)
+    if getattr(send_result, "success", True) is False:
+        raise RuntimeError(
+            f"approval text-send failed: {getattr(send_result, 'error', None) or 'unknown error'}"
+        )
+
+
 def _gateway_provider_error_reply(text: str) -> str:
     """Map raw provider/API errors to a short user-safe Telegram reply."""
     if _GATEWAY_AUTH_ERROR_RE.search(text):
@@ -18735,65 +18805,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # the redacted value.
                 cmd = _redact_approval_command(cmd)
 
-                # Prefer button-based approval when the adapter supports it.
-                # Check the *class* for the method, not the instance — avoids
-                # false positives from MagicMock auto-attribute creation in tests.
-                if getattr(type(_status_adapter), "send_exec_approval", None) is not None:
-                    try:
-                        _approval_fut = safe_schedule_threadsafe(
-                            _status_adapter.send_exec_approval(
-                                chat_id=_status_chat_id,
-                                command=cmd,
-                                session_key=_approval_session_key,
-                                description=desc,
-                                metadata=_status_thread_metadata,
-                            ),
-                            _loop_for_step,
-                            logger=logger,
-                            log_message="send_exec_approval scheduling error",
-                        )
-                        if _approval_fut is None:
-                            raise RuntimeError("send_exec_approval: loop unavailable")
-                        _approval_result = _approval_fut.result(timeout=15)
-                        if _approval_result.success:
-                            return
-                        logger.warning(
-                            "Button-based approval failed (send returned error), falling back to text: %s",
-                            _approval_result.error,
-                        )
-                    except Exception as _e:
-                        logger.warning(
-                            "Button-based approval failed, falling back to text: %s", _e
-                        )
-
-                # Fallback: plain text approval prompt.  Use the adapter's
-                # typed prefix so Slack/Matrix users are told the form they
-                # can actually type (`!approve`) — typed "/" is blocked in
-                # Slack threads and reserved by Matrix clients.
-                _p = getattr(_status_adapter, "typed_command_prefix", "/")
-                cmd_preview = cmd[:200] + "..." if len(cmd) > 200 else cmd
-                msg = (
-                    f"⚠️ **Dangerous command requires approval:**\n"
-                    f"```\n{cmd_preview}\n```\n"
-                    f"Reason: {desc}\n\n"
-                    f"Reply `{_p}approve` to execute, `{_p}approve session` to approve this pattern "
-                    f"for the session, `{_p}approve always` to approve permanently, or `{_p}deny` to cancel."
+                _send_exec_approval_or_text_sync(
+                    adapter=_status_adapter,
+                    chat_id=_status_chat_id,
+                    command=cmd,
+                    session_key=_approval_session_key,
+                    description=desc,
+                    metadata=_status_thread_metadata,
+                    loop=_loop_for_step,
                 )
-                try:
-                    _approval_send_fut = safe_schedule_threadsafe(
-                        _status_adapter.send(
-                            _status_chat_id,
-                            msg,
-                            metadata=_status_thread_metadata,
-                        ),
-                        _loop_for_step,
-                        logger=logger,
-                        log_message="Approval text-send scheduling error",
-                    )
-                    if _approval_send_fut is not None:
-                        _approval_send_fut.result(timeout=15)
-                except Exception as _e:
-                    logger.error("Failed to send approval request: %s", _e)
 
             # Keep real user text separate from API-only recovery guidance.  If
             # an auto-continue note is prepended below, persist the original

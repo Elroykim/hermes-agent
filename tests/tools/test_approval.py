@@ -992,11 +992,12 @@ class TestPatternKeyUniqueness:
         _, key_delete, _ = detect_dangerous_command("find . -name '*.tmp' -delete")
         session = "test_find_collision"
         _clear_session(session)
-        approve_session(session, key_exec)
-        assert is_approved(session, key_exec) is True
-        assert is_approved(session, key_delete) is False, (
-            "approving find -exec rm should not auto-approve find -delete"
-        )
+        with mock_patch.object(approval_module, "_permanent_approved", set()):
+            approve_session(session, key_exec)
+            assert is_approved(session, key_exec) is True
+            assert is_approved(session, key_delete) is False, (
+                "approving find -exec rm should not auto-approve find -delete"
+            )
         _clear_session(session)
 
     def test_legacy_find_key_still_approves_find_exec(self):
@@ -2200,6 +2201,58 @@ class TestApprovalTimeoutIsNotConsent:
         assert last_post.get("choice") == "timeout", (
             f"hook choice should be 'timeout' on no-response, got {last_post.get('choice')!r}"
         )
+
+    def test_gateway_timeout_falls_back_to_approval_timeout_when_absent(self, monkeypatch):
+        """approvals.timeout remains the default gateway approval timeout knob."""
+        from tools import approval as mod
+
+        monkeypatch.setattr(
+            mod,
+            "_get_approval_config",
+            lambda: {"mode": "manual", "timeout": 7},
+        )
+
+        assert mod._get_gateway_approval_timeout() == 7
+
+    def test_gateway_timeout_defaults_to_documented_approval_timeout(self, monkeypatch):
+        from tools import approval as mod
+
+        monkeypatch.setattr(mod, "_get_approval_config", lambda: {"mode": "manual"})
+
+        assert mod._get_gateway_approval_timeout() == 300
+
+    def test_gateway_timeout_invalid_value_falls_back_to_documented_default(self, monkeypatch):
+        from tools import approval as mod
+
+        monkeypatch.setattr(
+            mod,
+            "_get_approval_config",
+            lambda: {"mode": "manual", "timeout": "not-an-int"},
+        )
+
+        assert mod._get_gateway_approval_timeout() == 300
+
+    def test_invalid_gateway_timeout_override_falls_back_to_documented_default(self, monkeypatch):
+        from tools import approval as mod
+
+        monkeypatch.setattr(
+            mod,
+            "_get_approval_config",
+            lambda: {"mode": "manual", "timeout": 7, "gateway_timeout": "not-an-int"},
+        )
+
+        assert mod._get_gateway_approval_timeout() == 300
+
+    def test_gateway_timeout_overrides_approval_timeout_when_present(self, monkeypatch):
+        from tools import approval as mod
+
+        monkeypatch.setattr(
+            mod,
+            "_get_approval_config",
+            lambda: {"mode": "manual", "timeout": 7, "gateway_timeout": 11},
+        )
+
+        assert mod._get_gateway_approval_timeout() == 11
 
 
 class TestTirithImportErrorFailOpenPolicy:

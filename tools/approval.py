@@ -1859,6 +1859,24 @@ def _get_approval_timeout() -> int:
         return 60
 
 
+def _get_gateway_approval_timeout() -> int:
+    """Read the gateway approval timeout.
+
+    ``approvals.timeout`` is the user-facing approval timeout knob.  Gateways
+    may override it with ``approvals.gateway_timeout`` for long chat-response
+    windows, but an absent gateway-specific key must inherit ``timeout`` rather
+    than silently stretching an explicitly configured install to the historical
+    5-minute default.  When neither key is configured (or the selected value is
+    invalid), keep the documented approval timeout default of 300 seconds.
+    """
+    try:
+        cfg = _get_approval_config()
+        raw = cfg.get("gateway_timeout", cfg.get("timeout", 300))
+        return int(raw)
+    except (ValueError, TypeError):
+        return 300
+
+
 def _get_cron_approval_mode() -> str:
     """Read the cron approval mode from config. Returns 'deny' or 'approve'."""
     try:
@@ -2472,11 +2490,7 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
     # slices so we can fire activity heartbeats every ~10s to the agent's
     # inactivity tracker — otherwise the gateway watchdog kills the agent
     # while the user is still responding. Mirrors _wait_for_process() cadence.
-    timeout = _get_approval_config().get("gateway_timeout", 300)
-    try:
-        timeout = int(timeout)
-    except (ValueError, TypeError):
-        timeout = 300
+    timeout = _get_gateway_approval_timeout()
 
     try:
         from tools.environments.base import touch_activity_if_due
