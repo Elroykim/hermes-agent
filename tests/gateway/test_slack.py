@@ -376,6 +376,7 @@ class TestSlackSocketWatchdog:
                 self.client = MagicMock()
                 self.client.proxy = proxy
                 self.client.is_connected = lambda: True
+                self.client.aiohttp_client_session = None
                 self._start_event = asyncio.Event()
                 self.closed = False
                 self.start_calls = 0
@@ -405,9 +406,9 @@ class TestSlackSocketWatchdog:
         mock_app.command = _noop_decorator
         mock_app.action = _noop_decorator
         mock_app.client = AsyncMock()
-        # Prevent AsyncMock from auto-creating a truthy _session.closed
+        # Prevent AsyncMock from auto-creating a truthy session.closed
         # which would make _is_aiohttp_session_closed return True spuriously.
-        mock_app.client._session = None
+        mock_app.client.session = None
 
         mock_web_client = AsyncMock()
         mock_web_client.auth_test = AsyncMock(
@@ -692,6 +693,7 @@ class TestSlackClosedSessionReconnect:
                 self.client = MagicMock()
                 self.client.proxy = proxy
                 self.client.is_connected = lambda: True
+                self.client.aiohttp_client_session = None
                 self._start_event = asyncio.Event()
                 self.closed = False
                 self.start_calls = 0
@@ -708,7 +710,9 @@ class TestSlackClosedSessionReconnect:
         return FakeHandler, instances
 
     def _patch_stack(self, fake_factory):
-        """Return patchers for a full connect() call."""
+        """Return a list of patcher context managers — same pattern as
+        TestSlackSocketWatchdog but with the closed-session reconnect
+        scenario in mind."""
         mock_app = MagicMock()
 
         def _noop_decorator(_):
@@ -720,9 +724,9 @@ class TestSlackClosedSessionReconnect:
         mock_app.command = _noop_decorator
         mock_app.action = _noop_decorator
         mock_app.client = AsyncMock()
-        # Prevent AsyncMock from auto-creating a truthy _session.closed
+        # Prevent AsyncMock from auto-creating a truthy session.closed
         # which would make _is_aiohttp_session_closed return True spuriously.
-        mock_app.client._session = None
+        mock_app.client.session = None
 
         mock_web_client = AsyncMock()
         mock_web_client.auth_test = AsyncMock(
@@ -763,9 +767,10 @@ class TestSlackClosedSessionReconnect:
                 assert await adapter.connect() is True
                 assert len(instances) == 1
 
-                # Simulate a closed aiohttp session.
-                adapter._app.client._session = MagicMock()
-                adapter._app.client._session.closed = True
+                # Simulate a closed aiohttp session on the SocketMode client
+                # (the real attribute the detector inspects).
+                adapter._handler.client.aiohttp_client_session = MagicMock()
+                adapter._handler.client.aiohttp_client_session.closed = True
 
                 # Patch connect() to track whether it's called directly
                 # (the bug) vs. via a scheduled task (the fix).
@@ -837,9 +842,10 @@ class TestSlackClosedSessionReconnect:
             try:
                 assert await adapter.connect() is True
 
-                # Simulate a closed aiohttp session.
-                adapter._app.client._session = MagicMock()
-                adapter._app.client._session.closed = True
+                # Simulate a closed aiohttp session on the SocketMode client
+                # (the real attribute the detector inspects).
+                adapter._handler.client.aiohttp_client_session = MagicMock()
+                adapter._handler.client.aiohttp_client_session.closed = True
 
                 # Track how many times connect(is_reconnect=True) is called.
                 connect_call_count = 0
@@ -890,9 +896,10 @@ class TestSlackClosedSessionReconnect:
 
             assert await adapter.connect() is True
 
-            # Simulate a closed aiohttp session.
-            adapter._app.client._session = MagicMock()
-            adapter._app.client._session.closed = True
+            # Simulate a closed aiohttp session on the SocketMode client
+            # (the real attribute the detector inspects).
+            adapter._handler.client.aiohttp_client_session = MagicMock()
+            adapter._handler.client.aiohttp_client_session.closed = True
 
             # Schedule a reconnect (but don't let it run yet).
             result = await adapter._restart_socket_mode("test")
@@ -931,9 +938,10 @@ class TestSlackClosedSessionReconnect:
                 assert watchdog is not None
                 assert not watchdog.done()
 
-                # Simulate a closed aiohttp session.
-                adapter._app.client._session = MagicMock()
-                adapter._app.client._session.closed = True
+                # Simulate a closed aiohttp session on the SocketMode client
+                # (the real attribute the detector inspects).
+                adapter._handler.client.aiohttp_client_session = MagicMock()
+                adapter._handler.client.aiohttp_client_session.closed = True
 
                 # Schedule a reconnect.
                 await adapter._restart_socket_mode("test")

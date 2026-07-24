@@ -52,6 +52,8 @@ def _make_adapter():
     config = PlatformConfig(enabled=True, token="xoxb-test-token")
     adapter = SlackAdapter(config)
     adapter._app = MagicMock()
+    adapter._app.client = MagicMock()
+    adapter._app.client.session = None
     adapter._bot_user_id = "U_BOT"
     adapter._team_clients = {"T1": AsyncMock()}
     adapter._team_bot_user_ids = {"T1": "U_BOT"}
@@ -729,11 +731,26 @@ class TestClosedSessionRecovery:
     @pytest.mark.asyncio
     async def test_is_aiohttp_session_closed_returns_true_when_closed(self):
         """_is_aiohttp_session_closed returns True when the underlying
-        aiohttp ClientSession is closed."""
+        aiohttp ClientSession is closed (via SocketMode client path)."""
         adapter = _make_adapter()
         mock_session = MagicMock()
         mock_session.closed = True
-        adapter._app.client._session = mock_session
+        # Set the SocketMode client's aiohttp_client_session (the real path)
+        adapter._handler = MagicMock()
+        adapter._handler.client = MagicMock()
+        adapter._handler.client.aiohttp_client_session = mock_session
+
+        result = await adapter._is_aiohttp_session_closed()
+        assert result is True
+
+    @pytest.mark.asyncio
+    async def test_is_aiohttp_session_closed_returns_true_via_web_client(self):
+        """_is_aiohttp_session_closed returns True when the web client's
+        public ``session`` attribute is closed (defensive fallback)."""
+        adapter = _make_adapter()
+        mock_session = MagicMock()
+        mock_session.closed = True
+        adapter._app.client.session = mock_session
 
         result = await adapter._is_aiohttp_session_closed()
         assert result is True
@@ -744,7 +761,9 @@ class TestClosedSessionRecovery:
         adapter = _make_adapter()
         mock_session = MagicMock()
         mock_session.closed = False
-        adapter._app.client._session = mock_session
+        adapter._handler = MagicMock()
+        adapter._handler.client = MagicMock()
+        adapter._handler.client.aiohttp_client_session = mock_session
 
         result = await adapter._is_aiohttp_session_closed()
         assert result is False
@@ -752,9 +771,20 @@ class TestClosedSessionRecovery:
     @pytest.mark.asyncio
     async def test_is_aiohttp_session_closed_no_session(self):
         """_is_aiohttp_session_closed returns False when there is no
-        _session attribute (e.g. before first API call)."""
+        aiohttp_client_session attribute (e.g. before first API call)."""
         adapter = _make_adapter()
-        adapter._app.client._session = None
+        adapter._handler = MagicMock()
+        adapter._handler.client = MagicMock()
+        adapter._handler.client.aiohttp_client_session = None
+
+        result = await adapter._is_aiohttp_session_closed()
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_is_aiohttp_session_closed_no_handler(self):
+        """_is_aiohttp_session_closed returns False when _handler is None."""
+        adapter = _make_adapter()
+        adapter._handler = None
 
         result = await adapter._is_aiohttp_session_closed()
         assert result is False
@@ -778,7 +808,9 @@ class TestClosedSessionRecovery:
         adapter._app_token = "xapp-test"
         mock_session = MagicMock()
         mock_session.closed = True
-        adapter._app.client._session = mock_session
+        adapter._handler = MagicMock()
+        adapter._handler.client = MagicMock()
+        adapter._handler.client.aiohttp_client_session = mock_session
 
         with (
             patch.object(adapter, "connect", new=AsyncMock()) as mock_connect,
@@ -810,7 +842,7 @@ class TestClosedSessionRecovery:
         adapter._app_token = "xapp-test"
         mock_session = MagicMock()
         mock_session.closed = False
-        adapter._app.client._session = mock_session
+        adapter._app.client.session = mock_session
 
         with patch.object(adapter, "connect", new=AsyncMock()) as mock_connect:
             with patch.object(adapter, "_start_socket_mode_handler") as mock_start:

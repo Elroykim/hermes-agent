@@ -562,20 +562,36 @@ class SlackAdapter(BasePlatformAdapter):
         Socket Mode websocket being disconnected — the websocket can be
         restarted without rebuilding the app, but a closed session requires
         a full ``AsyncApp`` / ``AsyncWebClient`` rebuild via ``connect()``.
+
+        The session that actually raises ``Session is closed`` at runtime is
+        the SocketMode client's ``aiohttp_client_session`` (used in
+        ``ws_connect()``).  We check that first, then defensively check the
+        web client's public ``session`` attribute.
         """
         if not self._app:
             return False
         try:
+            # 1. Check the SocketMode client's aiohttp session first — this is
+            #    the session that raises ``Session is closed`` during
+            #    ws_connect() in the aiohttp-based SocketMode client.
+            handler = getattr(self, "_handler", None)
+            if handler is not None:
+                sm_client = getattr(handler, "client", None)
+                if sm_client is not None:
+                    sm_session = getattr(sm_client, "aiohttp_client_session", None)
+                    if sm_session is not None and sm_session.closed:
+                        return True
+
+            # 2. Defensively check the web client's public ``session``
+            #    attribute (AsyncWebClient stores it as ``self.session``, not
+            #    ``self._session``).
             client = self._app.client
-            if client is None:
-                return False
-            # The Slack SDK stores its aiohttp session on the underlying
-            # ``AsyncWebClient._session`` attribute.  We probe it without
-            # triggering a new connection.
-            session = getattr(client, "_session", None)
-            if session is None:
-                return False
-            return session.closed
+            if client is not None:
+                wc_session = getattr(client, "session", None)
+                if wc_session is not None and wc_session.closed:
+                    return True
+
+            return False
         except Exception:  # pragma: no cover - defensive
             logger.debug(
                 "[Slack] Could not inspect aiohttp session state", exc_info=True
