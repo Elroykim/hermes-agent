@@ -550,9 +550,69 @@ class SlackAdapter(BasePlatformAdapter):
             )
             return None
 
+    async def _is_aiohttp_session_closed(self) -> bool:
+        """Check whether the underlying aiohttp ClientSession is closed.
+
+        When the aiohttp session is closed, the Slack SDK's internal HTTP
+        client cannot make any API calls and every request raises
+        ``RuntimeError: Session is closed``.  This is distinct from the
+        Socket Mode websocket being disconnected — the websocket can be
+        restarted without rebuilding the app, but a closed session requires
+        a full ``AsyncApp`` / ``AsyncWebClient`` rebuild via ``connect()``.
+        """
+        if not self._app:
+            return False
+        try:
+            client = self._app.client
+            if client is None:
+                return False
+            # The Slack SDK stores its aiohttp session on the underlying
+            # ``AsyncWebClient._session`` attribute.  We probe it without
+            # triggering a new connection.
+            session = getattr(client, "_session", None)
+            if session is None:
+                return False
+            return session.closed
+        except Exception:  # pragma: no cover - defensive
+            logger.debug(
+                "[Slack] Could not inspect aiohttp session state", exc_info=True
+            )
+            return False
+
     async def _restart_socket_mode(self, reason: str) -> None:
-        """Reconnect Socket Mode without rebuilding adapter state."""
+        """Reconnect Socket Mode, rebuilding the full app if the aiohttp
+        session is closed.
+
+        When the underlying aiohttp ``ClientSession`` is closed (e.g. after
+        a transport-level error), every Slack API call raises
+        ``RuntimeError: Session is closed``.  In that case a simple Socket
+        Mode handler restart is insufficient — we must rebuild the
+        ``AsyncApp`` and all ``AsyncWebClient`` instances via
+        ``connect(is_reconnect=True)``.
+
+        When only the websocket transport is unhealthy, we restart just the
+        Socket Mode handler, preserving the existing app/client state.
+        """
         if not self._running:
+            return
+
+        # Check for closed aiohttp session *before* acquiring the reconnect
+        # lock, because connect() itself may need the lock (via
+        # _ensure_socket_watchdog).  A closed session requires a full app
+        # rebuild, which is a heavyweight operation that should not be
+        # serialised behind the socket reconnect lock.
+        session_closed = await self._is_aiohttp_session_closed()
+        if session_closed:
+            logger.warning(
+                "[Slack] aiohttp session closed (%s); rebuilding full app",
+                reason,
+            )
+            try:
+                await self.connect(is_reconnect=True)
+            except Exception as exc:  # pragma: no cover - defensive logging
+                logger.error(
+                    "[Slack] Full app rebuild failed: %s", exc, exc_info=True
+                )
             return
 
         async with self._socket_reconnect_lock:
@@ -3674,6 +3734,39 @@ class SlackAdapter(BasePlatformAdapter):
                 choice,
                 user_name,
             )
+
+            # When count == 0, the approval had already expired or was
+            # already resolved by another click.  Update the message to
+            # clearly show the button click was NOT applied.
+            if count == 0:
+                expired_text = (
+                    f"⏳ Expired — {choice} by {user_name} (no pending approval)"
+                )
+                try:
+                    await self._get_client(channel_id).chat_update(
+                        channel=channel_id,
+                        ts=msg_ts,
+                        text=expired_text,
+                        blocks=[
+                            {
+                                "type": "section",
+                                "text": {
+                                    "type": "mrkdwn",
+                                    "text": original_text or "Command approval request",
+                                },
+                            },
+                            {
+                                "type": "context",
+                                "elements": [
+                                    {"type": "mrkdwn", "text": expired_text},
+                                ],
+                            },
+                        ],
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "[Slack] Failed to update expired approval message: %s", e
+                    )
         except Exception as exc:
             logger.error(
                 "Failed to resolve gateway approval from Slack button: %s", exc

@@ -715,3 +715,173 @@ class TestThreadEngagement:
                 for t in to_remove:
                     adapter._mentioned_threads.discard(t)
         assert len(adapter._mentioned_threads) <= 10
+
+
+# ===========================================================================
+# Closed-session self-recovery
+# ===========================================================================
+
+class TestClosedSessionRecovery:
+    """Test that _restart_socket_mode detects a closed aiohttp session and
+    triggers a full app rebuild via connect()."""
+
+    @pytest.mark.asyncio
+    async def test_is_aiohttp_session_closed_returns_true_when_closed(self):
+        """_is_aiohttp_session_closed returns True when the underlying
+        aiohttp ClientSession is closed."""
+        adapter = _make_adapter()
+        mock_session = MagicMock()
+        mock_session.closed = True
+        adapter._app.client._session = mock_session
+
+        result = await adapter._is_aiohttp_session_closed()
+        assert result is True
+
+    @pytest.mark.asyncio
+    async def test_is_aiohttp_session_closed_returns_false_when_open(self):
+        """_is_aiohttp_session_closed returns False when the session is open."""
+        adapter = _make_adapter()
+        mock_session = MagicMock()
+        mock_session.closed = False
+        adapter._app.client._session = mock_session
+
+        result = await adapter._is_aiohttp_session_closed()
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_is_aiohttp_session_closed_no_session(self):
+        """_is_aiohttp_session_closed returns False when there is no
+        _session attribute (e.g. before first API call)."""
+        adapter = _make_adapter()
+        adapter._app.client._session = None
+
+        result = await adapter._is_aiohttp_session_closed()
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_is_aiohttp_session_closed_no_app(self):
+        """_is_aiohttp_session_closed returns False when _app is None."""
+        adapter = _make_adapter()
+        adapter._app = None
+
+        result = await adapter._is_aiohttp_session_closed()
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_restart_calls_connect_when_session_closed(self):
+        """_restart_socket_mode calls connect(is_reconnect=True) when the
+        aiohttp session is closed, instead of just restarting the handler."""
+        adapter = _make_adapter()
+        adapter._running = True
+        adapter._app_token = "xapp-test"
+        mock_session = MagicMock()
+        mock_session.closed = True
+        adapter._app.client._session = mock_session
+
+        with patch.object(adapter, "connect", new=AsyncMock()) as mock_connect:
+            await adapter._restart_socket_mode("test closed session")
+
+        mock_connect.assert_awaited_once_with(is_reconnect=True)
+
+    @pytest.mark.asyncio
+    async def test_restart_skips_connect_when_session_open(self):
+        """_restart_socket_mode does NOT call connect() when the session is
+        open — it falls through to the normal handler restart path."""
+        adapter = _make_adapter()
+        adapter._running = True
+        adapter._app_token = "xapp-test"
+        mock_session = MagicMock()
+        mock_session.closed = False
+        adapter._app.client._session = mock_session
+
+        with patch.object(adapter, "connect", new=AsyncMock()) as mock_connect:
+            with patch.object(adapter, "_start_socket_mode_handler") as mock_start:
+                await adapter._restart_socket_mode("test open session")
+
+        mock_connect.assert_not_called()
+        mock_start.assert_called_once()
+
+
+# ===========================================================================
+# Approval late-click — count == 0 UX
+# ===========================================================================
+
+class TestApprovalLateClick:
+    """Test that when resolve_gateway_approval returns 0 (expired / already
+    resolved), the message is updated to show the click was NOT applied."""
+
+    @pytest.mark.asyncio
+    async def test_count_zero_shows_expired(self):
+        """When resolve_gateway_approval returns 0, the message is updated
+        with an 'Expired' label instead of claiming approval."""
+        adapter = _make_adapter()
+        _attach_auth_runner(adapter)
+        adapter._approval_resolved["1234.5678"] = False
+
+        ack = AsyncMock()
+        body = {
+            "message": {
+                "ts": "1234.5678",
+                "blocks": [
+                    {"type": "section", "text": {"type": "mrkdwn", "text": "original text"}},
+                    {"type": "actions", "elements": []},
+                ],
+            },
+            "channel": {"id": "C1"},
+            "user": {"name": "norbert", "id": "U_NORBERT"},
+        }
+        action = {
+            "action_id": "hermes_approve_once",
+            "value": "agent:main:slack:group:C1:1111",
+        }
+
+        mock_client = adapter._team_clients["T1"]
+        mock_client.chat_update = AsyncMock()
+
+        with patch("tools.approval.resolve_gateway_approval", return_value=0) as mock_resolve:
+            await adapter._handle_approval_action(ack, body, action)
+
+        ack.assert_called_once()
+        mock_resolve.assert_called_once_with("agent:main:slack:group:C1:1111", "once")
+
+        # Should have called chat_update TWICE: first for the initial
+        # decision_text update, then for the expired override.
+        assert mock_client.chat_update.await_count == 2
+        second_call_kwargs = mock_client.chat_update.await_args_list[1][1]
+        assert "Expired" in second_call_kwargs["text"]
+        assert "no pending approval" in second_call_kwargs["text"]
+
+    @pytest.mark.asyncio
+    async def test_count_nonzero_does_not_show_expired(self):
+        """When resolve_gateway_approval returns >0, the message is NOT
+        updated with an 'Expired' label — only the initial decision_text
+        update is made."""
+        adapter = _make_adapter()
+        _attach_auth_runner(adapter)
+        adapter._approval_resolved["1234.5678"] = False
+
+        ack = AsyncMock()
+        body = {
+            "message": {
+                "ts": "1234.5678",
+                "blocks": [
+                    {"type": "section", "text": {"type": "mrkdwn", "text": "original text"}},
+                ],
+            },
+            "channel": {"id": "C1"},
+            "user": {"name": "alice", "id": "U_ALICE"},
+        }
+        action = {"action_id": "hermes_deny", "value": "session-key"}
+
+        mock_client = adapter._team_clients["T1"]
+        mock_client.chat_update = AsyncMock()
+
+        with patch("tools.approval.resolve_gateway_approval", return_value=1) as mock_resolve:
+            await adapter._handle_approval_action(ack, body, action)
+
+        mock_resolve.assert_called_once_with("session-key", "deny")
+        # Only one chat_update call (the initial decision_text update)
+        assert mock_client.chat_update.await_count == 1
+        update_kwargs = mock_client.chat_update.await_args_list[0][1]
+        assert "Denied by alice" in update_kwargs["text"]
+        assert "Expired" not in update_kwargs["text"]
