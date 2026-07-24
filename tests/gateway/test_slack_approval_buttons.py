@@ -1,6 +1,7 @@
 """Tests for Slack Block Kit approval buttons and thread context fetching."""
 
 import asyncio
+import os
 import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -766,11 +767,12 @@ class TestClosedSessionRecovery:
 
         result = await adapter._is_aiohttp_session_closed()
         assert result is False
-
     @pytest.mark.asyncio
     async def test_restart_calls_connect_when_session_closed(self):
-        """_restart_socket_mode calls connect(is_reconnect=True) when the
-        aiohttp session is closed, instead of just restarting the handler."""
+        """_restart_socket_mode schedules a reconnect task (rather than
+        directly awaiting connect()) when the aiohttp session is closed,
+        to prevent self-await from the watchdog loop.
+        """
         adapter = _make_adapter()
         adapter._running = True
         adapter._app_token = "xapp-test"
@@ -778,10 +780,26 @@ class TestClosedSessionRecovery:
         mock_session.closed = True
         adapter._app.client._session = mock_session
 
-        with patch.object(adapter, "connect", new=AsyncMock()) as mock_connect:
-            await adapter._restart_socket_mode("test closed session")
+        with (
+            patch.object(adapter, "connect", new=AsyncMock()) as mock_connect,
+            patch.dict(os.environ, {"SLACK_APP_TOKEN": "xapp-test"}, clear=False),
+        ):
+            result = await adapter._restart_socket_mode("test closed session")
 
-        mock_connect.assert_awaited_once_with(is_reconnect=True)
+            # Must return True (scheduled, not done inline).
+            assert result is True
+
+            # connect() must NOT have been called directly (no self-await).
+            mock_connect.assert_not_called()
+
+            # A reconnect task must have been scheduled.
+            assert adapter._reconnect_task is not None
+            assert not adapter._reconnect_task.done()
+
+            # Let the reconnect task run and verify it calls connect.
+            # (Patch is still active inside the with block.)
+            await adapter._reconnect_task
+            mock_connect.assert_awaited_once_with(is_reconnect=True)
 
     @pytest.mark.asyncio
     async def test_restart_skips_connect_when_session_open(self):

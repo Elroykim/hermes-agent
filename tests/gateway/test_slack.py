@@ -405,6 +405,9 @@ class TestSlackSocketWatchdog:
         mock_app.command = _noop_decorator
         mock_app.action = _noop_decorator
         mock_app.client = AsyncMock()
+        # Prevent AsyncMock from auto-creating a truthy _session.closed
+        # which would make _is_aiohttp_session_closed return True spuriously.
+        mock_app.client._session = None
 
         mock_web_client = AsyncMock()
         mock_web_client.auth_test = AsyncMock(
@@ -660,6 +663,299 @@ class TestSlackSocketWatchdog:
                 assert (
                     new_handlers <= 2
                 ), f"reconnect lock failed: {new_handlers} new handlers"
+            finally:
+                await adapter.disconnect()
+
+
+class TestSlackClosedSessionReconnect:
+    """Regression tests for the closed-session reconnect path.
+
+    The critical live-path flaw: _restart_socket_mode's closed-session path
+    used to directly await self.connect(), which cancels and awaits the
+    watchdog task — a self-await when called from the watchdog loop.
+    Also, concurrent watchdog + done-callback could launch duplicate full
+    rebuilds because the closed-session path bypassed _socket_reconnect_lock.
+
+    These tests exercise the real task relationship (not only mock call
+    counts) to catch self-await/cancellation and concurrent scheduling.
+    """
+
+    def _make_fake_handler_factory(self):
+        """Return (factory, instances) — same pattern as TestSlackSocketWatchdog."""
+        instances: list = []
+
+        class FakeHandler:
+            def __init__(self, app, app_token, proxy=None):
+                self.app = app
+                self.app_token = app_token
+                self.proxy = proxy
+                self.client = MagicMock()
+                self.client.proxy = proxy
+                self.client.is_connected = lambda: True
+                self._start_event = asyncio.Event()
+                self.closed = False
+                self.start_calls = 0
+                instances.append(self)
+
+            async def start_async(self):
+                self.start_calls += 1
+                await self._start_event.wait()
+
+            async def close_async(self):
+                self.closed = True
+                self._start_event.set()
+
+        return FakeHandler, instances
+
+    def _patch_stack(self, fake_factory):
+        """Return patchers for a full connect() call."""
+        mock_app = MagicMock()
+
+        def _noop_decorator(_):
+            def decorator(fn):
+                return fn
+            return decorator
+
+        mock_app.event = _noop_decorator
+        mock_app.command = _noop_decorator
+        mock_app.action = _noop_decorator
+        mock_app.client = AsyncMock()
+        # Prevent AsyncMock from auto-creating a truthy _session.closed
+        # which would make _is_aiohttp_session_closed return True spuriously.
+        mock_app.client._session = None
+
+        mock_web_client = AsyncMock()
+        mock_web_client.auth_test = AsyncMock(
+            return_value={
+                "user_id": "U_BOT",
+                "user": "testbot",
+                "team_id": "T_FAKE",
+                "team": "FakeTeam",
+            }
+        )
+
+        return [
+            patch.object(_slack_mod, "AsyncApp", return_value=mock_app),
+            patch.object(_slack_mod, "AsyncWebClient", return_value=mock_web_client),
+            patch.object(_slack_mod, "AsyncSocketModeHandler", fake_factory),
+            patch.dict(os.environ, {"SLACK_APP_TOKEN": "xapp-fake"}),
+            patch("gateway.status.acquire_scoped_lock", return_value=(True, None)),
+            patch("gateway.status.release_scoped_lock"),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_closed_session_schedules_reconnect_task_not_direct_await(self):
+        """When aiohttp session is closed, _restart_socket_mode must schedule
+        a dedicated task rather than directly awaiting connect().
+
+        This prevents the self-await bug where the watchdog loop would
+        cancel and await itself.
+        """
+        adapter = SlackAdapter(PlatformConfig(enabled=True, token="xoxb-fake"))
+        adapter._socket_watchdog_interval_s = 9999
+        factory, instances = self._make_fake_handler_factory()
+
+        with contextlib.ExitStack() as stack:
+            for p in self._patch_stack(factory):
+                stack.enter_context(p)
+
+            try:
+                assert await adapter.connect() is True
+                assert len(instances) == 1
+
+                # Simulate a closed aiohttp session.
+                adapter._app.client._session = MagicMock()
+                adapter._app.client._session.closed = True
+
+                # Patch connect() to track whether it's called directly
+                # (the bug) vs. via a scheduled task (the fix).
+                original_connect = adapter.connect
+                connect_called_directly = False
+
+                async def _tracking_connect(*, is_reconnect=False):
+                    nonlocal connect_called_directly
+                    # If we're the current watchdog task, this is a self-await.
+                    current = asyncio.current_task()
+                    if current is adapter._socket_watchdog_task:
+                        connect_called_directly = True
+                    return await original_connect(is_reconnect=is_reconnect)
+
+                adapter.connect = _tracking_connect  # type: ignore[assignment]
+
+                # Call _restart_socket_mode from the watchdog context.
+                # We simulate this by calling it directly (the watchdog loop
+                # would do the same).
+                result = await adapter._restart_socket_mode("test closed session")
+
+                # Must return True (scheduled, not done inline).
+                assert result is True, (
+                    f"Expected True (scheduled), got {result}"
+                )
+
+                # connect() must NOT have been called directly from this
+                # context (no self-await).
+                assert not connect_called_directly, (
+                    "connect() was called directly from _restart_socket_mode "
+                    "(self-await bug)"
+                )
+
+                # A reconnect task must have been scheduled.
+                assert adapter._reconnect_task is not None
+                assert not adapter._reconnect_task.done()
+
+                # The reconnect task must NOT be the watchdog task.
+                assert adapter._reconnect_task is not adapter._socket_watchdog_task, (
+                    "Reconnect task is the same as watchdog task (self-await)"
+                )
+
+                # Let the reconnect task run and verify it calls connect.
+                await asyncio.sleep(0)
+                await asyncio.sleep(0)
+
+                # After the reconnect task completes, the slot should be cleared.
+                if adapter._reconnect_task is not None:
+                    await adapter._reconnect_task
+                assert adapter._reconnect_task is None, (
+                    "Reconnect task slot was not cleared after completion"
+                )
+            finally:
+                await adapter.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_closed_session_duplicate_rebuilds_prevented(self):
+        """Concurrent callers (watchdog + done-callback) must not launch
+        duplicate full rebuilds when the aiohttp session is closed.
+        """
+        adapter = SlackAdapter(PlatformConfig(enabled=True, token="xoxb-fake"))
+        adapter._socket_watchdog_interval_s = 9999
+        factory, instances = self._make_fake_handler_factory()
+
+        with contextlib.ExitStack() as stack:
+            for p in self._patch_stack(factory):
+                stack.enter_context(p)
+
+            try:
+                assert await adapter.connect() is True
+
+                # Simulate a closed aiohttp session.
+                adapter._app.client._session = MagicMock()
+                adapter._app.client._session.closed = True
+
+                # Track how many times connect(is_reconnect=True) is called.
+                connect_call_count = 0
+                original_connect = adapter.connect
+
+                async def _counting_connect(*, is_reconnect=False):
+                    nonlocal connect_call_count
+                    connect_call_count += 1
+                    return await original_connect(is_reconnect=is_reconnect)
+
+                adapter.connect = _counting_connect  # type: ignore[assignment]
+
+                # Simulate concurrent calls: watchdog loop + done-callback.
+                result1 = await adapter._restart_socket_mode("watchdog")
+                result2 = await adapter._restart_socket_mode("done-callback")
+
+                # Both must report "scheduled" (True).
+                assert result1 is True
+                assert result2 is True
+
+                # Only one reconnect task should exist.
+                assert adapter._reconnect_task is not None
+                assert not adapter._reconnect_task.done()
+
+                # Let the reconnect task complete.
+                await adapter._reconnect_task
+
+                # connect() must have been called exactly once.
+                assert connect_call_count == 1, (
+                    f"Expected 1 connect() call, got {connect_call_count} "
+                    "(duplicate rebuild bug)"
+                )
+            finally:
+                await adapter.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_disconnect_cancels_pending_reconnect_task(self):
+        """disconnect() must cancel any pending full-reconnect task so it
+        doesn't fire after teardown.
+        """
+        adapter = SlackAdapter(PlatformConfig(enabled=True, token="xoxb-fake"))
+        adapter._socket_watchdog_interval_s = 9999
+        factory, instances = self._make_fake_handler_factory()
+
+        with contextlib.ExitStack() as stack:
+            for p in self._patch_stack(factory):
+                stack.enter_context(p)
+
+            assert await adapter.connect() is True
+
+            # Simulate a closed aiohttp session.
+            adapter._app.client._session = MagicMock()
+            adapter._app.client._session.closed = True
+
+            # Schedule a reconnect (but don't let it run yet).
+            result = await adapter._restart_socket_mode("test")
+            assert result is True
+            assert adapter._reconnect_task is not None
+            assert not adapter._reconnect_task.done()
+
+            # Now disconnect — must cancel the pending reconnect.
+            await adapter.disconnect()
+
+            # Reconnect task should be done (cancelled).
+            assert adapter._reconnect_task is None or adapter._reconnect_task.done()
+            assert adapter._handler is None
+            assert adapter._socket_mode_task is None
+            assert adapter._socket_watchdog_task is None
+
+    @pytest.mark.asyncio
+    async def test_closed_session_reconnect_does_not_self_cancel_watchdog(self):
+        """The scheduled reconnect task must not cancel the watchdog that
+        scheduled it — they are different tasks.  connect() will cancel
+        the old watchdog (that's by design), but the cancellation must
+        come from a *different* task, not from the watchdog cancelling
+        itself.
+        """
+        adapter = SlackAdapter(PlatformConfig(enabled=True, token="xoxb-fake"))
+        adapter._socket_watchdog_interval_s = 9999
+        factory, instances = self._make_fake_handler_factory()
+
+        with contextlib.ExitStack() as stack:
+            for p in self._patch_stack(factory):
+                stack.enter_context(p)
+
+            try:
+                assert await adapter.connect() is True
+                watchdog = adapter._socket_watchdog_task
+                assert watchdog is not None
+                assert not watchdog.done()
+
+                # Simulate a closed aiohttp session.
+                adapter._app.client._session = MagicMock()
+                adapter._app.client._session.closed = True
+
+                # Schedule a reconnect.
+                await adapter._restart_socket_mode("test")
+                assert adapter._reconnect_task is not None
+
+                # The reconnect task must be a DIFFERENT task from the
+                # watchdog — this is the core fix: no self-await.
+                assert adapter._reconnect_task is not watchdog, (
+                    "Reconnect task IS the watchdog task (self-await bug)"
+                )
+
+                # Let the reconnect task run to completion.
+                await adapter._reconnect_task
+
+                # The watchdog was cancelled by connect() running in the
+                # reconnect task — that's fine because it's a different
+                # task doing the cancellation.  The important thing is
+                # that a new watchdog was installed.
+                assert watchdog.done()
+                assert adapter._socket_watchdog_task is not None
+                assert adapter._socket_watchdog_task is not watchdog
+                assert not adapter._socket_watchdog_task.done()
             finally:
                 await adapter.disconnect()
 

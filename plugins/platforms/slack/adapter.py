@@ -486,6 +486,9 @@ class SlackAdapter(BasePlatformAdapter):
         self._socket_watchdog_task: Optional[asyncio.Task] = None
         self._socket_reconnect_lock = asyncio.Lock()
         self._socket_watchdog_interval_s = 15.0
+        # Track a scheduled full reconnect task so concurrent callers
+        # (watchdog loop + done-callback) cannot launch duplicate rebuilds.
+        self._reconnect_task: Optional[asyncio.Task] = None
 
     def _start_socket_mode_handler(self) -> None:
         """Start the Slack Socket Mode background task."""
@@ -579,9 +582,9 @@ class SlackAdapter(BasePlatformAdapter):
             )
             return False
 
-    async def _restart_socket_mode(self, reason: str) -> None:
-        """Reconnect Socket Mode, rebuilding the full app if the aiohttp
-        session is closed.
+    async def _restart_socket_mode(self, reason: str) -> bool:
+        """Reconnect Socket Mode, returning True if a full reconnect was
+        scheduled (caller should not continue with handler restart).
 
         When the underlying aiohttp ``ClientSession`` is closed (e.g. after
         a transport-level error), every Slack API call raises
@@ -590,11 +593,18 @@ class SlackAdapter(BasePlatformAdapter):
         ``AsyncApp`` and all ``AsyncWebClient`` instances via
         ``connect(is_reconnect=True)``.
 
+        Because ``connect()`` cancels and awaits the watchdog task, calling
+        it directly from the watchdog loop would be a **self-await** (the
+        watchdog IS the current task).  Instead we schedule a dedicated
+        reconnect task and track it in ``_reconnect_task`` so concurrent
+        callers (watchdog loop + done-callback) cannot launch duplicate
+        rebuilds.
+
         When only the websocket transport is unhealthy, we restart just the
         Socket Mode handler, preserving the existing app/client state.
         """
         if not self._running:
-            return
+            return False
 
         # Check for closed aiohttp session *before* acquiring the reconnect
         # lock, because connect() itself may need the lock (via
@@ -604,20 +614,24 @@ class SlackAdapter(BasePlatformAdapter):
         session_closed = await self._is_aiohttp_session_closed()
         if session_closed:
             logger.warning(
-                "[Slack] aiohttp session closed (%s); rebuilding full app",
+                "[Slack] aiohttp session closed (%s); scheduling full rebuild",
                 reason,
             )
-            try:
-                await self.connect(is_reconnect=True)
-            except Exception as exc:  # pragma: no cover - defensive logging
-                logger.error(
-                    "[Slack] Full app rebuild failed: %s", exc, exc_info=True
+            # Schedule a dedicated reconnect task so we never self-await
+            # (the watchdog loop or done-callback is the current task).
+            if self._reconnect_task is not None and not self._reconnect_task.done():
+                logger.debug(
+                    "[Slack] Full rebuild already scheduled; skipping duplicate"
                 )
-            return
+                return True
+            self._reconnect_task = asyncio.create_task(
+                self._run_full_reconnect(reason)
+            )
+            return True
 
         async with self._socket_reconnect_lock:
             if not self._running or not self._app or not self._app_token:
-                return
+                return False
 
             logger.warning("[Slack] Socket Mode unhealthy (%s); reconnecting", reason)
             await self._stop_socket_mode_handler()
@@ -628,6 +642,25 @@ class SlackAdapter(BasePlatformAdapter):
                 logger.error(
                     "[Slack] Socket Mode reconnect failed: %s", exc, exc_info=True
                 )
+            return False
+
+    async def _run_full_reconnect(self, reason: str) -> None:
+        """Dedicated task for a full app rebuild via connect(is_reconnect=True).
+
+        This runs in its own task so the watchdog loop / done-callback never
+        self-await.  On completion the reconnect-task slot is cleared so a
+        subsequent failure can schedule a fresh rebuild.
+        """
+        try:
+            await self.connect(is_reconnect=True)
+        except Exception as exc:  # pragma: no cover - defensive logging
+            logger.error(
+                "[Slack] Full app rebuild failed: %s", exc, exc_info=True
+            )
+        finally:
+            # Clear the slot so a future failure can schedule a fresh rebuild.
+            if self._reconnect_task is asyncio.current_task():
+                self._reconnect_task = None
 
     async def _socket_watchdog_loop(self) -> None:
         """Monitor Socket Mode and reconnect if the task/transport dies.
@@ -644,16 +677,22 @@ class SlackAdapter(BasePlatformAdapter):
 
                 task = self._socket_mode_task
                 if task is None:
-                    await self._restart_socket_mode("socket task missing")
+                    scheduled = await self._restart_socket_mode("socket task missing")
+                    if scheduled:
+                        continue
                     continue
 
                 if task.done():
-                    await self._restart_socket_mode("socket task stopped")
+                    scheduled = await self._restart_socket_mode("socket task stopped")
+                    if scheduled:
+                        continue
                     continue
 
                 connected = await self._socket_transport_connected()
                 if connected is False:
-                    await self._restart_socket_mode("transport disconnected")
+                    scheduled = await self._restart_socket_mode("transport disconnected")
+                    if scheduled:
+                        continue
             except asyncio.CancelledError:
                 raise
             except Exception:  # pragma: no cover - defensive logging
@@ -718,6 +757,9 @@ class SlackAdapter(BasePlatformAdapter):
             loop = asyncio.get_running_loop()
         except RuntimeError:
             return
+        # Schedule via _restart_socket_mode which handles dedup and
+        # self-await safety.  We use loop.create_task so the done-callback
+        # itself never blocks.
         loop.create_task(self._restart_socket_mode("socket task exited"))
 
     def _describe_slack_api_error(
@@ -1376,6 +1418,21 @@ class SlackAdapter(BasePlatformAdapter):
     async def disconnect(self) -> None:
         """Disconnect from Slack."""
         self._running = False
+
+        # Cancel any pending full-reconnect task so it doesn't fire
+        # after we've torn down.
+        reconnect_task = self._reconnect_task
+        self._reconnect_task = None
+        if reconnect_task is not None and not reconnect_task.done():
+            reconnect_task.cancel()
+            try:
+                await reconnect_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:  # pragma: no cover - defensive logging
+                logger.debug(
+                    "[Slack] Reconnect task raised during disconnect", exc_info=True
+                )
 
         watchdog_task = self._socket_watchdog_task
         self._socket_watchdog_task = None
