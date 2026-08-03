@@ -7774,9 +7774,29 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # a sibling process legitimately holding the write lock for seconds
         # (VACUUM, TRUNCATE checkpoint at close, an older pre-bounded-merge
         # process's FTS optimize) can't destroy a healthy turn (#74478).
-        return self._execute_write(
+        msg_id = self._execute_write(
             _do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S
         )
+        try:
+            from agent.blackbox_bridge import record_session_message
+
+            record_session_message(
+                session_id=session_id,
+                message_id=msg_id,
+                role=role,
+                content=content,
+                tool_name=tool_name,
+                tool_calls=tool_calls,
+                tool_call_id=tool_call_id,
+                token_count=token_count,
+                finish_reason=finish_reason,
+                platform_message_id=platform_message_id,
+                observed=observed,
+                timestamp=timestamp,
+            )
+        except Exception as exc:
+            logger.debug("blackbox bridge append_message hook failed: %s", exc)
+        return msg_id
 
     def append_messages_batch(
         self,
@@ -8268,6 +8288,17 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
 
         self._execute_write(_do)
+        try:
+            from agent.blackbox_bridge import record_transcript_event
+
+            record_transcript_event(
+                session_id=session_id,
+                event_type="transcript_rewrite",
+                messages=messages,
+                extra={"reason": "replace_messages"},
+            )
+        except Exception as exc:
+            logger.debug("blackbox bridge replace_messages hook failed: %s", exc)
 
     def has_archived_messages(self, session_id: str) -> bool:
         """Return True if the session has any soft-archived (``active = 0``) rows.
@@ -8356,7 +8387,19 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 )
             return inserted
 
-        return self._execute_write(_do)
+        inserted = self._execute_write(_do)
+        try:
+            from agent.blackbox_bridge import record_transcript_event
+
+            record_transcript_event(
+                session_id=session_id,
+                event_type="context_compaction",
+                messages=compacted_messages,
+                extra={"active_message_count": inserted},
+            )
+        except Exception as exc:
+            logger.debug("blackbox bridge archive_and_compact hook failed: %s", exc)
+        return inserted
 
     def set_latest_user_api_content(
         self, session_id: str, content: Any, api_content: str

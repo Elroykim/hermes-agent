@@ -33,6 +33,14 @@ DEFAULT_CONFIG = {
     # sessions (no live client) so accumulated agents don't pile up under memory
     # pressure. Reopening one re-resumes it from disk. 0/null disables.
     "max_live_sessions": 16,
+    # Optional append-only audit mirror for SessionDB persistence. Recording
+    # failures are fail-open and never block the primary Hermes database.
+    "blackbox": {
+        "enabled": False,
+        "agent_id": "MINA",
+        "thewon_system": "/Users/elroy/TheWon/System",
+        "project": "TheWon",
+    },
     "agent": {
         "max_turns": 500,
         # Inactivity timeout for gateway agent execution (seconds).
