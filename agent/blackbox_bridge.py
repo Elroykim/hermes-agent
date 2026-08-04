@@ -15,6 +15,7 @@ import base64
 import hashlib
 import json
 import logging
+import math
 import os
 import struct
 import sys
@@ -214,6 +215,25 @@ def _enabled(cfg: Mapping[str, Any]) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in {"1", "true", "yes", "on"}
     return bool(value)
+
+
+def _outbox_delivery_after(cfg: Mapping[str, Any]) -> tuple[float | None, bool]:
+    """Return an optional inclusive outbox cutover timestamp.
+
+    A configured malformed value is fail-closed so activating a profile cannot
+    accidentally replay preserved history. Omitting the field retains existing
+    delivery semantics for profiles that do not need a recovery cutover.
+    """
+    value = cfg.get("outbox_delivery_after")
+    if value is None:
+        return None, True
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None, False
+    if not math.isfinite(parsed) or parsed < 0:
+        return None, False
+    return parsed, True
 
 
 def _resolve_thewon_system(cfg: Mapping[str, Any]) -> Path:
@@ -509,6 +529,7 @@ def status() -> dict[str, Any]:
     config = _resolve_config()
     recorder_resolution = _resolve_recorder(config)
     cfg = config.config
+    delivery_after, delivery_after_valid = _outbox_delivery_after(cfg)
     return {
         "enabled": _enabled(cfg),
         "agent_id": cfg.get("agent_id") or "MINA",
@@ -520,4 +541,6 @@ def status() -> dict[str, Any]:
             else None
         ),
         "delivery_gate": MIRROR_DELIVERY_GATE,
+        "outbox_delivery_after": delivery_after,
+        "outbox_delivery_after_valid": delivery_after_valid,
     }

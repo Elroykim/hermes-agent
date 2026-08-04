@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
 from types import SimpleNamespace
 
 import agent.blackbox_bridge as bridge
@@ -162,6 +163,29 @@ def test_disabled_bridge_defers_outbox_without_retrying_or_marking_error(
     assert row["status"] == "pending"
     assert row["attempt_count"] == 0
     assert row["last_error_type"] is None
+
+
+def test_cutover_only_delivers_rows_created_after_configured_timestamp(
+    monkeypatch, tmp_path
+):
+    recorder = _DurableRecorder()
+    config = {"enabled": True, "agent_id": "MINA", "project": "TheWon"}
+    monkeypatch.setattr(bridge, "_load_cfg", lambda: config)
+    monkeypatch.setattr(bridge, "_get_recorder", lambda _cfg: recorder)
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        db.create_session("s1", "test")
+        config["enabled"] = False
+        db.append_message("s1", role="user", content="historic")
+        config["enabled"] = True
+        config["outbox_delivery_after"] = time.time()
+        db.append_message("s1", role="assistant", content="canary")
+        rows = _outbox_rows(db)
+    finally:
+        db.close()
+
+    assert [row["status"] for row in rows] == ["pending", "delivered"]
+    assert [row["attempt_count"] for row in rows] == [0, 1]
 
 
 def test_receiver_failure_reopens_and_auto_delivers_pending_once(monkeypatch, tmp_path):

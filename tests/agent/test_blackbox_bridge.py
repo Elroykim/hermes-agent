@@ -98,6 +98,17 @@ def test_record_session_message_builds_append_only_event(monkeypatch):
     assert result.status == "recorded"
 
 
+def test_status_rejects_malformed_outbox_cutover(monkeypatch):
+    monkeypatch.setattr(
+        bridge,
+        "_load_cfg",
+        lambda: {"enabled": True, "outbox_delivery_after": "not-a-timestamp"},
+    )
+
+    assert bridge.status()["outbox_delivery_after"] is None
+    assert bridge.status()["outbox_delivery_after_valid"] is False
+
+
 def test_content_raw_round_trips_bytes_and_structured_content(monkeypatch):
     recorder = MagicMock()
     recorder.record.return_value = "evt-raw"

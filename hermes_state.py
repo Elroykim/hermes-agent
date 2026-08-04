@@ -7720,21 +7720,34 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         try:
             from agent.blackbox_bridge import status as blackbox_status
 
-            if not bool(blackbox_status().get("enabled")):
+            bridge_status = blackbox_status()
+            if not bool(bridge_status.get("enabled")):
                 logger.info("blackbox durable outbox deferred: bridge disabled")
                 return 0
+            if not bool(bridge_status.get("outbox_delivery_after_valid", True)):
+                logger.warning("blackbox durable outbox deferred: invalid cutover")
+                return 0
+            delivery_after = bridge_status.get("outbox_delivery_after")
         except Exception:
             # A diagnostic failure must not turn a configured bridge into a
             # permanent no-op. The per-row delivery path retains its own
             # fail-open error handling and observability.
-            pass
+            delivery_after = None
         with self._lock:
-            pending = self._conn.execute(
-                "SELECT id, event_id, payload_json, payload_sha256 "
-                "FROM blackbox_message_outbox WHERE status = 'pending' "
-                "ORDER BY id LIMIT ?",
-                (int(limit),),
-            ).fetchall()
+            if delivery_after is None:
+                pending = self._conn.execute(
+                    "SELECT id, event_id, payload_json, payload_sha256 "
+                    "FROM blackbox_message_outbox WHERE status = 'pending' "
+                    "ORDER BY id LIMIT ?",
+                    (int(limit),),
+                ).fetchall()
+            else:
+                pending = self._conn.execute(
+                    "SELECT id, event_id, payload_json, payload_sha256 "
+                    "FROM blackbox_message_outbox WHERE status = 'pending' "
+                    "AND created_at >= ? ORDER BY id LIMIT ?",
+                    (float(delivery_after), int(limit)),
+                ).fetchall()
         delivered = 0
         for row in pending:
             actual_sha256 = hashlib.sha256(
