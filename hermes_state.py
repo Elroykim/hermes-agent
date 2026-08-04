@@ -2826,6 +2826,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             # racing session lifecycle and the surprise disk/latency cost on
             # an unattended open. (An interrupted optimize resumes when the
             # user re-runs the command.)
+            self._drain_blackbox_message_outbox_after_commit()
         except Exception as exc:
             # Capture the cause so /resume and friends can surface WHY the
             # session DB is unavailable instead of a bare "Session database

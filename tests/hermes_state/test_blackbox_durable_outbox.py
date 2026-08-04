@@ -146,7 +146,7 @@ def test_missing_receiver_api_keeps_pending_without_failing_session(
     assert outbox["attempt_count"] == 1
 
 
-def test_receiver_failure_reopens_and_delivers_pending_once(monkeypatch, tmp_path):
+def test_receiver_failure_reopens_and_auto_delivers_pending_once(monkeypatch, tmp_path):
     failing = _DurableRecorder(fail=True)
     _configure(monkeypatch, failing)
     path = tmp_path / "state.db"
@@ -162,7 +162,6 @@ def test_receiver_failure_reopens_and_delivers_pending_once(monkeypatch, tmp_pat
     _configure(monkeypatch, healthy)
     reopened = SessionDB(db_path=path)
     try:
-        assert reopened.drain_blackbox_message_outbox() == 1
         assert reopened.drain_blackbox_message_outbox() == 0
         row = _outbox_rows(reopened)[0]
     finally:
