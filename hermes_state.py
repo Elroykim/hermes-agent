@@ -7780,7 +7780,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         try:
             from agent.blackbox_bridge import record_session_message
 
-            record_session_message(
+            mirror_result = record_session_message(
                 session_id=session_id,
                 message_id=msg_id,
                 role=role,
@@ -7794,8 +7794,26 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 observed=observed,
                 timestamp=timestamp,
             )
+            if getattr(mirror_result, "status", None) == "failed":
+                logger.warning(
+                    "blackbox bridge append_message failed: "
+                    "session_id=%s platform_message_id=%s row_id=%s "
+                    "reason=%s error_type=%s",
+                    session_id,
+                    platform_message_id,
+                    msg_id,
+                    getattr(mirror_result, "reason", "UNKNOWN"),
+                    getattr(mirror_result, "error_type", "UnknownError"),
+                )
         except Exception as exc:
-            logger.debug("blackbox bridge append_message hook failed: %s", exc)
+            logger.warning(
+                "blackbox bridge append_message hook failed: "
+                "session_id=%s platform_message_id=%s row_id=%s error_type=%s",
+                session_id,
+                platform_message_id,
+                msg_id,
+                type(exc).__name__,
+            )
         return msg_id
 
     def append_messages_batch(
@@ -7846,11 +7864,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return inserted_total
 
         def _do(conn):
+            inserted_ids: List[int] = []
             self._check_transcript_write_guards(
                 conn, session_id, compression_lock_holder
             )
             inserted, tool_calls_total = self._insert_message_rows(
-                conn, session_id, messages
+                conn, session_id, messages, inserted_ids=inserted_ids
             )
             # One aggregated counter update for the whole batch.
             if tool_calls_total > 0:
@@ -7864,12 +7883,75 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     "UPDATE sessions SET message_count = message_count + ? WHERE id = ?",
                     (inserted, session_id),
                 )
-            return inserted
+            return inserted, inserted_ids
 
         # Same criticality as append_message: this IS the turn's transcript.
-        return self._execute_write(
+        inserted, inserted_ids = self._execute_write(
             _do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S
         )
+        try:
+            from agent.blackbox_bridge import record_session_message
+        except Exception as exc:
+            logger.warning(
+                "blackbox bridge append_messages_batch import failed: "
+                "session_id=%s message_count=%s error_type=%s",
+                session_id,
+                inserted,
+                type(exc).__name__,
+            )
+            return inserted
+
+        for batch_index, (message_id, message) in enumerate(
+            zip(inserted_ids, messages)
+        ):
+            tool_calls = message.get("tool_calls")
+            if isinstance(tool_calls, str):
+                try:
+                    tool_calls = json.loads(tool_calls)
+                except (json.JSONDecodeError, TypeError):
+                    tool_calls = []
+            platform_message_id = (
+                message.get("platform_message_id") or message.get("message_id")
+            )
+            try:
+                mirror_result = record_session_message(
+                    session_id=session_id,
+                    message_id=message_id,
+                    role=message.get("role", "unknown"),
+                    content=message.get("content"),
+                    tool_name=message.get("tool_name"),
+                    tool_calls=tool_calls,
+                    tool_call_id=message.get("tool_call_id"),
+                    token_count=message.get("token_count"),
+                    finish_reason=message.get("finish_reason"),
+                    platform_message_id=platform_message_id,
+                    observed=bool(message.get("observed")),
+                    timestamp=message.get("timestamp"),
+                )
+                if getattr(mirror_result, "status", None) == "failed":
+                    logger.warning(
+                        "blackbox bridge append_messages_batch failed: "
+                        "session_id=%s platform_message_id=%s row_id=%s "
+                        "batch_index=%s reason=%s error_type=%s",
+                        session_id,
+                        platform_message_id,
+                        message_id,
+                        batch_index,
+                        getattr(mirror_result, "reason", "UNKNOWN"),
+                        getattr(mirror_result, "error_type", "UnknownError"),
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "blackbox bridge append_messages_batch hook failed: "
+                    "session_id=%s platform_message_id=%s row_id=%s "
+                    "batch_index=%s error_type=%s",
+                    session_id,
+                    platform_message_id,
+                    message_id,
+                    batch_index,
+                    type(exc).__name__,
+                )
+        return inserted
 
     def set_latest_matching_message_display_kind(
         self, session_id: str, *, role: str, content: str, display_kind: str,
@@ -8113,7 +8195,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         return row[0] if row else None
 
-    def _insert_message_rows(self, conn, session_id: str, messages: List[Dict[str, Any]]) -> tuple[int, int]:
+    def _insert_message_rows(
+        self,
+        conn,
+        session_id: str,
+        messages: List[Dict[str, Any]],
+        *,
+        inserted_ids: Optional[List[int]] = None,
+    ) -> tuple[int, int]:
         """Insert *messages* as fresh active rows for *session_id*.
 
         Shared by :meth:`replace_messages` (delete-then-insert) and
@@ -8166,7 +8255,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
             api_content = msg.get("api_content")
 
-            conn.execute(
+            cursor = conn.execute(
                 """INSERT INTO messages (session_id, role, content, tool_call_id,
                    tool_calls, tool_name, effect_disposition, timestamp, token_count, finish_reason,
                    reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
@@ -8196,6 +8285,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     self._encode_display_metadata(msg.get("display_metadata")),
                 ),
             )
+            if inserted_ids is not None:
+                inserted_ids.append(int(cursor.lastrowid))
             inserted += 1
             if tool_calls is not None:
                 tool_calls_total += (
@@ -8291,14 +8382,28 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         try:
             from agent.blackbox_bridge import record_transcript_event
 
-            record_transcript_event(
+            mirror_result = record_transcript_event(
                 session_id=session_id,
                 event_type="transcript_rewrite",
                 messages=messages,
                 extra={"reason": "replace_messages"},
             )
+            if getattr(mirror_result, "status", None) == "failed":
+                logger.warning(
+                    "blackbox bridge transcript event failed: "
+                    "session_id=%s event_type=transcript_rewrite "
+                    "reason=%s error_type=%s",
+                    session_id,
+                    getattr(mirror_result, "reason", "UNKNOWN"),
+                    getattr(mirror_result, "error_type", "UnknownError"),
+                )
         except Exception as exc:
-            logger.debug("blackbox bridge replace_messages hook failed: %s", exc)
+            logger.warning(
+                "blackbox bridge transcript event hook failed: "
+                "session_id=%s event_type=transcript_rewrite error_type=%s",
+                session_id,
+                type(exc).__name__,
+            )
 
     def has_archived_messages(self, session_id: str) -> bool:
         """Return True if the session has any soft-archived (``active = 0``) rows.
@@ -8391,14 +8496,28 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         try:
             from agent.blackbox_bridge import record_transcript_event
 
-            record_transcript_event(
+            mirror_result = record_transcript_event(
                 session_id=session_id,
                 event_type="context_compaction",
                 messages=compacted_messages,
                 extra={"active_message_count": inserted},
             )
+            if getattr(mirror_result, "status", None) == "failed":
+                logger.warning(
+                    "blackbox bridge transcript event failed: "
+                    "session_id=%s event_type=context_compaction "
+                    "reason=%s error_type=%s",
+                    session_id,
+                    getattr(mirror_result, "reason", "UNKNOWN"),
+                    getattr(mirror_result, "error_type", "UnknownError"),
+                )
         except Exception as exc:
-            logger.debug("blackbox bridge archive_and_compact hook failed: %s", exc)
+            logger.warning(
+                "blackbox bridge transcript event hook failed: "
+                "session_id=%s event_type=context_compaction error_type=%s",
+                session_id,
+                type(exc).__name__,
+            )
         return inserted
 
     def set_latest_user_api_content(

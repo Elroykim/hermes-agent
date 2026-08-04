@@ -3,24 +3,170 @@
 The bridge sits below the agent loop at SessionDB persistence so gateway, CLI,
 cron, and future frontends share one append-only audit path. It is config-gated
 and fail-open: Blackbox failures must never block Hermes session persistence.
+
+SessionDB commits before this best-effort mirror runs. Without a durable outbox,
+a process crash in that interval can lose the Blackbox copy. That delivery gap
+is intentionally reported as OPEN and must not be described as closed.
 """
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import logging
 import os
+import struct
 import sys
 import threading
+from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from types import MappingProxyType
+from typing import Any, Literal, Optional
 
 logger = logging.getLogger(__name__)
 
 _lock = threading.Lock()
 _recorder: Any = None
 _recorder_key: tuple[str, str] | None = None
-_disabled_reason: str | None = None
+
+MIRROR_DELIVERY_GATE = "OPEN_NO_DURABLE_OUTBOX"
+
+
+@dataclass(frozen=True)
+class BlackboxRecordResult:
+    """Content-free outcome returned by every bridge write attempt."""
+
+    status: Literal["recorded", "disabled", "failed"]
+    event_id: str | None = None
+    reason: str | None = None
+    error_type: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.status not in {"recorded", "disabled", "failed"}:
+            raise ValueError("invalid Blackbox record status")
+        if self.status == "recorded" and (self.reason or self.error_type):
+            raise ValueError("recorded result cannot contain failure metadata")
+        if self.status != "recorded" and not self.reason:
+            raise ValueError("non-recorded result requires a reason")
+
+
+@dataclass(frozen=True)
+class _ConfigResolution:
+    """One call's immutable config snapshot and fail-closed outcome."""
+
+    config: Mapping[str, Any]
+    outcome: BlackboxRecordResult | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.config, MappingProxyType):
+            raise TypeError("config resolution must contain an immutable mapping")
+        if self.outcome is not None and self.outcome.status == "recorded":
+            raise ValueError("config resolution cannot report a recorded outcome")
+
+
+@dataclass(frozen=True)
+class _RecorderResolution:
+    """One call's recorder object or exact unavailable outcome."""
+
+    recorder: Any = None
+    outcome: BlackboxRecordResult | None = None
+
+    def __post_init__(self) -> None:
+        if (self.recorder is None) == (self.outcome is None):
+            raise ValueError("recorder resolution requires exactly one result")
+        if self.outcome is not None and self.outcome.status == "recorded":
+            raise ValueError("recorder resolution cannot report a recorded outcome")
+
+
+def _canonical_content_node(value: Any, active: set[int]) -> dict[str, Any]:
+    """Encode supported content types without lossy string coercion."""
+    if value is None:
+        return {"type": "none"}
+    if isinstance(value, bool):
+        return {"type": "bool", "value": value}
+    if isinstance(value, int):
+        return {"type": "int", "value": str(value)}
+    if isinstance(value, float):
+        return {
+            "type": "float",
+            "value": base64.b64encode(struct.pack(">d", value)).decode("ascii"),
+        }
+    if isinstance(value, str):
+        return {"type": "str", "value": value}
+    if isinstance(value, bytes):
+        return {
+            "type": "bytes",
+            "value": base64.b64encode(value).decode("ascii"),
+        }
+    if isinstance(value, bytearray):
+        return {
+            "type": "bytearray",
+            "value": base64.b64encode(bytes(value)).decode("ascii"),
+        }
+
+    if isinstance(value, (list, tuple, dict)):
+        identity = id(value)
+        if identity in active:
+            raise ValueError("cyclic content is not canonicalizable")
+        active.add(identity)
+        try:
+            if isinstance(value, (list, tuple)):
+                return {
+                    "type": "list" if isinstance(value, list) else "tuple",
+                    "items": [
+                        _canonical_content_node(item, active) for item in value
+                    ],
+                }
+
+            encoded_items: list[
+                tuple[str, str, dict[str, Any], dict[str, Any]]
+            ] = []
+            for key, item in value.items():
+                encoded_key = _canonical_content_node(key, active)
+                encoded_value = _canonical_content_node(item, active)
+                sort_key = json.dumps(
+                    encoded_key,
+                    ensure_ascii=True,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                value_sort_key = json.dumps(
+                    encoded_value,
+                    ensure_ascii=True,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                encoded_items.append(
+                    (sort_key, value_sort_key, encoded_key, encoded_value)
+                )
+            encoded_items.sort(key=lambda item: (item[0], item[1]))
+            return {
+                "type": "dict",
+                "items": [
+                    [encoded_key, encoded_value]
+                    for _, _, encoded_key, encoded_value in encoded_items
+                ],
+            }
+        finally:
+            active.remove(identity)
+
+    raise TypeError(f"unsupported Blackbox content type: {type(value).__name__}")
+
+
+def _canonical_content(value: Any) -> tuple[str, str]:
+    envelope = {
+        "schema": "hermes-blackbox-content/v1",
+        "content": _canonical_content_node(value, set()),
+    }
+    raw = json.dumps(
+        envelope,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return raw, hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 def _safe_text(value: Any, *, limit: int = 200_000) -> str:
@@ -53,25 +199,21 @@ def _safe_text(value: Any, *, limit: int = 200_000) -> str:
 
 
 def _load_cfg() -> dict[str, Any]:
-    try:
-        from hermes_cli.config import load_config
+    from hermes_cli.config import load_config
 
-        cfg = load_config() or {}
-    except Exception as exc:
-        logger.debug("blackbox_bridge: config load failed: %s", exc)
-        return {}
+    cfg = load_config() or {}
     section = cfg.get("blackbox") if isinstance(cfg, dict) else {}
     return section if isinstance(section, dict) else {}
 
 
-def _enabled(cfg: dict[str, Any]) -> bool:
+def _enabled(cfg: Mapping[str, Any]) -> bool:
     value = cfg.get("enabled", False)
     if isinstance(value, str):
         return value.strip().lower() in {"1", "true", "yes", "on"}
     return bool(value)
 
 
-def _resolve_thewon_system(cfg: dict[str, Any]) -> Path:
+def _resolve_thewon_system(cfg: Mapping[str, Any]) -> Path:
     raw = (
         cfg.get("thewon_system")
         or os.getenv("THEWON_SYSTEM")
@@ -80,11 +222,38 @@ def _resolve_thewon_system(cfg: dict[str, Any]) -> Path:
     return Path(str(raw)).expanduser().resolve()
 
 
-def _get_recorder(cfg: dict[str, Any]) -> Any:
+def _resolve_config() -> _ConfigResolution:
+    try:
+        config = _load_cfg()
+    except Exception as exc:
+        logger.debug(
+            "blackbox_bridge: config load failed: error_type=%s",
+            type(exc).__name__,
+        )
+        return _ConfigResolution(
+            config=MappingProxyType({}),
+            outcome=BlackboxRecordResult(
+                status="failed",
+                reason="CONFIG_LOAD_FAILED",
+                error_type=type(exc).__name__,
+            ),
+        )
+
+    frozen_config = MappingProxyType(dict(config))
+    if not _enabled(frozen_config):
+        return _ConfigResolution(
+            config=frozen_config,
+            outcome=BlackboxRecordResult(
+                status="disabled",
+                reason="CONFIG_DISABLED",
+            ),
+        )
+    return _ConfigResolution(config=frozen_config)
+
+
+def _get_recorder(cfg: Mapping[str, Any]) -> Any:
     """Return a cached BlackboxRecorder or None when unavailable."""
-    global _recorder, _recorder_key, _disabled_reason
-    if not _enabled(cfg):
-        return None
+    global _recorder, _recorder_key
 
     agent_id = str(cfg.get("agent_id") or "MINA").strip() or "MINA"
     thewon_system = _resolve_thewon_system(cfg)
@@ -93,23 +262,43 @@ def _get_recorder(cfg: dict[str, Any]) -> Any:
     with _lock:
         if _recorder is not None and _recorder_key == key:
             return _recorder
-        try:
-            system_root = thewon_system.parent / "00_System"
-            if str(system_root) not in sys.path:
-                sys.path.insert(0, str(system_root))
-            os.environ.setdefault("THEWON_SYSTEM", str(thewon_system))
-            from shared.blackbox_recorder import BlackboxRecorder
+        system_root = thewon_system.parent / "00_System"
+        if str(system_root) not in sys.path:
+            sys.path.insert(0, str(system_root))
+        os.environ.setdefault("THEWON_SYSTEM", str(thewon_system))
+        from shared.blackbox_recorder import BlackboxRecorder
 
-            _recorder = BlackboxRecorder(agent_id)
-            _recorder_key = key
-            _disabled_reason = None
-            return _recorder
-        except Exception as exc:
-            _recorder = None
-            _recorder_key = None
-            _disabled_reason = str(exc)
-            logger.warning("TheWon blackbox bridge unavailable: %s", exc)
-            return None
+        _recorder = BlackboxRecorder(agent_id)
+        _recorder_key = key
+        return _recorder
+
+
+def _resolve_recorder(config: _ConfigResolution) -> _RecorderResolution:
+    if config.outcome is not None:
+        return _RecorderResolution(outcome=config.outcome)
+    try:
+        recorder = _get_recorder(config.config)
+    except Exception as exc:
+        logger.warning(
+            "TheWon blackbox bridge unavailable: error_type=%s",
+            type(exc).__name__,
+        )
+        return _RecorderResolution(
+            outcome=BlackboxRecordResult(
+                status="failed",
+                reason="RECORDER_UNAVAILABLE",
+                error_type=type(exc).__name__,
+            )
+        )
+    if recorder is None:
+        return _RecorderResolution(
+            outcome=BlackboxRecordResult(
+                status="failed",
+                reason="RECORDER_UNAVAILABLE",
+                error_type="RecorderUnavailable",
+            )
+        )
+    return _RecorderResolution(recorder=recorder)
 
 
 def record_session_message(
@@ -126,18 +315,31 @@ def record_session_message(
     platform_message_id: Optional[str] = None,
     observed: bool = False,
     timestamp: Any = None,
-) -> None:
+) -> BlackboxRecordResult:
     """Append one Hermes message to TheWon raw Blackbox, best-effort."""
-    cfg = _load_cfg()
-    recorder = _get_recorder(cfg)
-    if recorder is None:
-        return
+    config = _resolve_config()
+    recorder_resolution = _resolve_recorder(config)
+    if recorder_resolution.outcome is not None:
+        return recorder_resolution.outcome
+    recorder = recorder_resolution.recorder
+    cfg = config.config
+
+    try:
+        content_raw, content_raw_sha256 = _canonical_content(content)
+    except Exception as exc:
+        return BlackboxRecordResult(
+            status="failed",
+            reason="CONTENT_CANONICALIZATION_FAILED",
+            error_type=type(exc).__name__,
+        )
 
     role = str(role or "unknown")
     data = {
         "source": "hermes_state",
         "message_role": role,
         "content_text": _safe_text(content),
+        "content_raw": content_raw,
+        "content_raw_sha256": content_raw_sha256,
         "message_id": message_id,
         "platform_message_id": platform_message_id,
         "tool_name": tool_name,
@@ -160,7 +362,7 @@ def record_session_message(
         event_type = "message"
 
     try:
-        recorder.record(
+        event_id = recorder.record(
             {
                 "type": event_type,
                 "session": session_id,
@@ -172,8 +374,16 @@ def record_session_message(
             session_id=session_id,
             request_id=str(platform_message_id or message_id or session_id),
         )
+        return BlackboxRecordResult(
+            status="recorded",
+            event_id=event_id if isinstance(event_id, str) else None,
+        )
     except Exception as exc:
-        logger.debug("TheWon blackbox message record failed: %s", exc)
+        return BlackboxRecordResult(
+            status="failed",
+            reason="RECORDER_WRITE_FAILED",
+            error_type=type(exc).__name__,
+        )
 
 
 def record_transcript_event(
@@ -182,14 +392,24 @@ def record_transcript_event(
     event_type: str,
     messages: list[dict[str, Any]] | None = None,
     extra: Optional[dict[str, Any]] = None,
-) -> None:
+) -> BlackboxRecordResult:
     """Record transcript-level rewrite or compaction boundaries."""
-    cfg = _load_cfg()
-    recorder = _get_recorder(cfg)
-    if recorder is None:
-        return
+    config = _resolve_config()
+    recorder_resolution = _resolve_recorder(config)
+    if recorder_resolution.outcome is not None:
+        return recorder_resolution.outcome
+    recorder = recorder_resolution.recorder
+    cfg = config.config
 
     messages = messages or []
+    try:
+        content_raw, content_raw_sha256 = _canonical_content(messages)
+    except Exception as exc:
+        return BlackboxRecordResult(
+            status="failed",
+            reason="CONTENT_CANONICALIZATION_FAILED",
+            error_type=type(exc).__name__,
+        )
     preview_parts: list[str] = []
     for message in messages[:20]:
         role = message.get("role", "unknown") if isinstance(message, dict) else "unknown"
@@ -202,11 +422,15 @@ def record_transcript_event(
         "event": event_type,
         "message_count": len(messages),
         "content_text": "\n\n".join(preview_parts),
+        "content_raw": content_raw,
+        "content_raw_sha256": content_raw_sha256,
     }
     if extra:
-        data.update(extra)
+        for key, value in extra.items():
+            if key not in data:
+                data[key] = value
     try:
-        recorder.record(
+        recorded_event_id = recorder.record(
             {
                 "type": event_type,
                 "session": session_id,
@@ -224,17 +448,34 @@ def record_transcript_event(
             session_id=session_id,
             request_id=f"{session_id}:{event_type}",
         )
+        return BlackboxRecordResult(
+            status="recorded",
+            event_id=(
+                recorded_event_id if isinstance(recorded_event_id, str) else None
+            ),
+        )
     except Exception as exc:
-        logger.debug("TheWon blackbox transcript event failed: %s", exc)
+        return BlackboxRecordResult(
+            status="failed",
+            reason="RECORDER_WRITE_FAILED",
+            error_type=type(exc).__name__,
+        )
 
 
 def status() -> dict[str, Any]:
     """Return a secret-free diagnostic snapshot."""
-    cfg = _load_cfg()
+    config = _resolve_config()
+    recorder_resolution = _resolve_recorder(config)
+    cfg = config.config
     return {
         "enabled": _enabled(cfg),
         "agent_id": cfg.get("agent_id") or "MINA",
         "thewon_system": str(_resolve_thewon_system(cfg)),
-        "recorder_ready": _get_recorder(cfg) is not None if _enabled(cfg) else False,
-        "disabled_reason": _disabled_reason,
+        "recorder_ready": recorder_resolution.recorder is not None,
+        "disabled_reason": (
+            recorder_resolution.outcome.reason
+            if recorder_resolution.outcome is not None
+            else None
+        ),
+        "delivery_gate": MIRROR_DELIVERY_GATE,
     }
