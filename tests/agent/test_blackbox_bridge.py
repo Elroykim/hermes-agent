@@ -17,6 +17,10 @@ def _result(status, **kwargs):
     return bridge.BlackboxRecordResult(status=status, **kwargs)
 
 
+def _durable_recorded(**kwargs):
+    return _result("recorded", event_id=kwargs["_durable_event_id"])
+
+
 def _decode_canonical(node):
     kind = node["type"]
     if kind == "none":
@@ -314,7 +318,7 @@ def test_crash_gap_is_explicitly_open_without_durable_outbox():
 
 
 def test_sessiondb_hooks_append_rewrite_and_compaction(monkeypatch, tmp_path):
-    message_hook = MagicMock(return_value=_result("recorded"))
+    message_hook = MagicMock(side_effect=_durable_recorded)
     transcript_hook = MagicMock(return_value=_result("recorded"))
     monkeypatch.setattr(bridge, "record_session_message", message_hook)
     monkeypatch.setattr(bridge, "record_transcript_event", transcript_hook)
@@ -385,11 +389,8 @@ def test_sessiondb_single_append_warns_on_structured_bridge_failure(
     finally:
         db.close()
 
-    assert "blackbox bridge append_message failed" in caplog.text
-    assert "session_id=s1" in caplog.text
-    assert "platform_message_id=platform-1" in caplog.text
-    assert f"row_id={row_id}" in caplog.text
-    assert "reason=RECORDER_WRITE_FAILED" in caplog.text
+    assert "blackbox durable outbox delivery pending" in caplog.text
+    assert "outbox_id=1" in caplog.text
     assert "error_type=RuntimeError" in caplog.text
 
 
@@ -455,7 +456,7 @@ def _batch_messages():
 
 
 def test_sessiondb_batch_mirrors_committed_rows_in_input_order(monkeypatch, tmp_path):
-    message_hook = MagicMock(return_value=_result("recorded"))
+    message_hook = MagicMock(side_effect=_durable_recorded)
     monkeypatch.setattr(bridge, "record_session_message", message_hook)
     db = SessionDB(db_path=tmp_path / "state.db")
     try:
@@ -493,7 +494,7 @@ def test_sessiondb_batch_mirrors_committed_rows_in_input_order(monkeypatch, tmp_
 
 
 def test_sessiondb_batch_db_failure_never_calls_bridge(monkeypatch, tmp_path):
-    message_hook = MagicMock(return_value=_result("recorded"))
+    message_hook = MagicMock(side_effect=_durable_recorded)
     monkeypatch.setattr(bridge, "record_session_message", message_hook)
     db = SessionDB(db_path=tmp_path / "state.db")
     try:
@@ -516,7 +517,7 @@ def test_sessiondb_batch_db_failure_never_calls_bridge(monkeypatch, tmp_path):
 
 
 def test_sessiondb_empty_batch_never_calls_bridge(monkeypatch, tmp_path):
-    message_hook = MagicMock(return_value=_result("recorded"))
+    message_hook = MagicMock(side_effect=_durable_recorded)
     monkeypatch.setattr(bridge, "record_session_message", message_hook)
     db = SessionDB(db_path=tmp_path / "state.db")
     try:
@@ -528,7 +529,7 @@ def test_sessiondb_empty_batch_never_calls_bridge(monkeypatch, tmp_path):
 
 
 def test_sessiondb_chunked_batch_preserves_global_bridge_order(monkeypatch, tmp_path):
-    message_hook = MagicMock(return_value=_result("recorded"))
+    message_hook = MagicMock(side_effect=_durable_recorded)
     monkeypatch.setattr(bridge, "record_session_message", message_hook)
     db = SessionDB(db_path=tmp_path / "state.db")
     try:
@@ -559,7 +560,7 @@ def test_sessiondb_batch_bridge_failure_is_observable_and_continues(
                 reason="RECORDER_WRITE_FAILED",
                 error_type="RuntimeError",
             )
-        return _result("recorded")
+        return _durable_recorded(**kwargs)
 
     monkeypatch.setattr(bridge, "record_session_message", flaky_hook)
     db = SessionDB(db_path=tmp_path / "state.db")
@@ -575,19 +576,15 @@ def test_sessiondb_batch_bridge_failure_is_observable_and_continues(
     assert [item["content"] for item in seen] == [
         message["content"] for message in _batch_messages()
     ]
-    assert "blackbox bridge append_messages_batch failed" in caplog.text
-    assert "session_id=s1" in caplog.text
-    assert "platform_message_id=None" in caplog.text
-    assert f"row_id={seen[1]['message_id']}" in caplog.text
-    assert "batch_index=1" in caplog.text
-    assert "reason=RECORDER_WRITE_FAILED" in caplog.text
+    assert "blackbox durable outbox delivery pending" in caplog.text
+    assert "outbox_id=2" in caplog.text
     assert "error_type=RuntimeError" in caplog.text
 
 
 def test_sessiondb_batch_retry_matches_single_append_duplicate_semantics(
     monkeypatch, tmp_path
 ):
-    message_hook = MagicMock(return_value=_result("recorded"))
+    message_hook = MagicMock(side_effect=_durable_recorded)
     monkeypatch.setattr(bridge, "record_session_message", message_hook)
     db = SessionDB(db_path=tmp_path / "state.db")
     message = {

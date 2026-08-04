@@ -361,6 +361,27 @@ _READ_POOL_MAX = 8
 # re-pointed DEFAULT_DB_PATH (tests monkeypatch the constant directly).
 _IMPORT_DEFAULT_DB_PATH = DEFAULT_DB_PATH
 
+_BLACKBOX_MESSAGE_OUTBOX_SQL = """
+CREATE TABLE IF NOT EXISTS blackbox_message_outbox (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id TEXT NOT NULL UNIQUE,
+    message_id INTEGER NOT NULL,
+    payload_json TEXT NOT NULL,
+    payload_sha256 TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending', 'delivered')),
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    created_at REAL NOT NULL,
+    last_attempt_at REAL,
+    delivered_at REAL,
+    receiver_event_id TEXT,
+    receiver_payload_sha256 TEXT,
+    last_error_type TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_blackbox_message_outbox_pending
+ON blackbox_message_outbox(status, id);
+"""
+
 
 def _default_db_path() -> Path:
     """Resolve the default state DB path at call time.
@@ -2732,6 +2753,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 self._conn.execute("PRAGMA foreign_keys=ON")
                 self._fts_cjk_loaded = load_fts5_cjk_extension(self._conn)
                 self._init_schema()
+                self._conn.executescript(_BLACKBOX_MESSAGE_OUTBOX_SQL)
 
             def _connect_and_init_with_lock_patience():
                 # Lock contention during open: _init_schema's DDL/reconcile
@@ -7640,6 +7662,157 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return value
         return json.dumps(value)
 
+    @staticmethod
+    def _canonical_blackbox_outbox_payload(payload: Dict[str, Any]) -> tuple[str, str]:
+        payload_json = json.dumps(
+            payload,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+        return payload_json, hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
+
+    def _enqueue_blackbox_message_outbox(self, conn, message_id: int) -> str:
+        row = conn.execute(
+            "SELECT id, session_id, role, content, tool_name, tool_calls, "
+            "tool_call_id, token_count, finish_reason, platform_message_id, "
+            "observed, timestamp FROM messages WHERE id = ?",
+            (message_id,),
+        ).fetchone()
+        if row is None:
+            raise RuntimeError(f"persisted message row missing: {message_id}")
+        tool_calls = row["tool_calls"]
+        if isinstance(tool_calls, str):
+            try:
+                tool_calls = json.loads(tool_calls)
+            except (json.JSONDecodeError, TypeError):
+                tool_calls = []
+        payload = {
+            "session_id": row["session_id"],
+            "message_id": int(row["id"]),
+            "role": row["role"],
+            "content": self._decode_content(row["content"]),
+            "tool_name": row["tool_name"],
+            "tool_calls": tool_calls,
+            "tool_call_id": row["tool_call_id"],
+            "token_count": row["token_count"],
+            "finish_reason": row["finish_reason"],
+            "platform_message_id": row["platform_message_id"],
+            "observed": bool(row["observed"]),
+            "timestamp": row["timestamp"],
+        }
+        payload_json, payload_sha256 = self._canonical_blackbox_outbox_payload(payload)
+        event_id = f"hermes-message-{message_id}-{payload_sha256}"
+        conn.execute(
+            "INSERT INTO blackbox_message_outbox ("
+            "event_id, message_id, payload_json, payload_sha256, created_at"
+            ") VALUES (?, ?, ?, ?, ?)",
+            (event_id, message_id, payload_json, payload_sha256, time.time()),
+        )
+        return event_id
+
+    def drain_blackbox_message_outbox(self, *, limit: int = 100) -> int:
+        """Best-effort delivery of committed message outbox rows."""
+        if self.read_only or limit <= 0:
+            return 0
+        with self._lock:
+            pending = self._conn.execute(
+                "SELECT id, event_id, payload_json, payload_sha256 "
+                "FROM blackbox_message_outbox WHERE status = 'pending' "
+                "ORDER BY id LIMIT ?",
+                (int(limit),),
+            ).fetchall()
+        delivered = 0
+        for row in pending:
+            actual_sha256 = hashlib.sha256(
+                row["payload_json"].encode("utf-8")
+            ).hexdigest()
+            if actual_sha256 != row["payload_sha256"]:
+                logger.warning(
+                    "blackbox durable outbox digest mismatch: outbox_id=%s event_id=%s",
+                    row["id"],
+                    row["event_id"],
+                )
+                continue
+
+            def _mark_attempt(conn):
+                conn.execute(
+                    "UPDATE blackbox_message_outbox "
+                    "SET attempt_count = attempt_count + 1, last_attempt_at = ?, "
+                    "last_error_type = NULL "
+                    "WHERE id = ? AND status = 'pending'",
+                    (time.time(), row["id"]),
+                )
+
+            self._execute_write(_mark_attempt)
+            try:
+                from agent.blackbox_bridge import record_session_message
+
+                payload = json.loads(row["payload_json"])
+                result = record_session_message(
+                    **payload,
+                    _durable_event_id=row["event_id"],
+                )
+            except Exception as exc:
+                result = None
+                error_type = type(exc).__name__
+            else:
+                error_type = getattr(result, "error_type", None)
+
+            if (
+                getattr(result, "status", None) == "recorded"
+                and getattr(result, "event_id", None) == row["event_id"]
+            ):
+                def _mark_delivered(conn):
+                    cursor = conn.execute(
+                        "UPDATE blackbox_message_outbox SET status = 'delivered', "
+                        "delivered_at = ?, receiver_event_id = ?, "
+                        "receiver_payload_sha256 = ?, last_error_type = NULL "
+                        "WHERE id = ? AND status = 'pending' "
+                        "AND payload_sha256 = ?",
+                        (
+                            time.time(),
+                            result.event_id,
+                            getattr(result, "receipt_payload_sha256", None),
+                            row["id"],
+                            row["payload_sha256"],
+                        ),
+                    )
+                    return cursor.rowcount
+
+                delivered += int(self._execute_write(_mark_delivered) or 0)
+                continue
+
+            def _mark_failed(conn):
+                conn.execute(
+                    "UPDATE blackbox_message_outbox SET last_error_type = ? "
+                    "WHERE id = ? AND status = 'pending'",
+                    (error_type or "UnknownError", row["id"]),
+                )
+
+            try:
+                self._execute_write(_mark_failed)
+            except Exception:
+                logger.debug("blackbox outbox failure marker failed", exc_info=True)
+            logger.warning(
+                "blackbox durable outbox delivery pending: outbox_id=%s "
+                "event_id=%s error_type=%s",
+                row["id"],
+                row["event_id"],
+                error_type or "UnknownError",
+            )
+        return delivered
+
+    def _drain_blackbox_message_outbox_after_commit(self) -> None:
+        try:
+            self.drain_blackbox_message_outbox()
+        except Exception:
+            logger.warning(
+                "blackbox durable outbox post-commit drain failed",
+                exc_info=True,
+            )
+
     def append_message(
         self,
         session_id: str,
@@ -7767,6 +7940,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     "UPDATE sessions SET message_count = message_count + 1 WHERE id = ?",
                     (session_id,),
                 )
+            self._enqueue_blackbox_message_outbox(conn, msg_id)
             return msg_id
 
         # Transcript append is THE critical write: its failure aborts the
@@ -7777,43 +7951,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         msg_id = self._execute_write(
             _do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S
         )
-        try:
-            from agent.blackbox_bridge import record_session_message
-
-            mirror_result = record_session_message(
-                session_id=session_id,
-                message_id=msg_id,
-                role=role,
-                content=content,
-                tool_name=tool_name,
-                tool_calls=tool_calls,
-                tool_call_id=tool_call_id,
-                token_count=token_count,
-                finish_reason=finish_reason,
-                platform_message_id=platform_message_id,
-                observed=observed,
-                timestamp=timestamp,
-            )
-            if getattr(mirror_result, "status", None) == "failed":
-                logger.warning(
-                    "blackbox bridge append_message failed: "
-                    "session_id=%s platform_message_id=%s row_id=%s "
-                    "reason=%s error_type=%s",
-                    session_id,
-                    platform_message_id,
-                    msg_id,
-                    getattr(mirror_result, "reason", "UNKNOWN"),
-                    getattr(mirror_result, "error_type", "UnknownError"),
-                )
-        except Exception as exc:
-            logger.warning(
-                "blackbox bridge append_message hook failed: "
-                "session_id=%s platform_message_id=%s row_id=%s error_type=%s",
-                session_id,
-                platform_message_id,
-                msg_id,
-                type(exc).__name__,
-            )
+        self._drain_blackbox_message_outbox_after_commit()
         return msg_id
 
     def append_messages_batch(
@@ -7871,6 +8009,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             inserted, tool_calls_total = self._insert_message_rows(
                 conn, session_id, messages, inserted_ids=inserted_ids
             )
+            for message_id in inserted_ids:
+                self._enqueue_blackbox_message_outbox(conn, message_id)
             # One aggregated counter update for the whole batch.
             if tool_calls_total > 0:
                 conn.execute(
@@ -7889,68 +8029,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         inserted, inserted_ids = self._execute_write(
             _do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S
         )
-        try:
-            from agent.blackbox_bridge import record_session_message
-        except Exception as exc:
-            logger.warning(
-                "blackbox bridge append_messages_batch import failed: "
-                "session_id=%s message_count=%s error_type=%s",
-                session_id,
-                inserted,
-                type(exc).__name__,
-            )
-            return inserted
-
-        for batch_index, (message_id, message) in enumerate(
-            zip(inserted_ids, messages)
-        ):
-            tool_calls = message.get("tool_calls")
-            if isinstance(tool_calls, str):
-                try:
-                    tool_calls = json.loads(tool_calls)
-                except (json.JSONDecodeError, TypeError):
-                    tool_calls = []
-            platform_message_id = (
-                message.get("platform_message_id") or message.get("message_id")
-            )
-            try:
-                mirror_result = record_session_message(
-                    session_id=session_id,
-                    message_id=message_id,
-                    role=message.get("role", "unknown"),
-                    content=message.get("content"),
-                    tool_name=message.get("tool_name"),
-                    tool_calls=tool_calls,
-                    tool_call_id=message.get("tool_call_id"),
-                    token_count=message.get("token_count"),
-                    finish_reason=message.get("finish_reason"),
-                    platform_message_id=platform_message_id,
-                    observed=bool(message.get("observed")),
-                    timestamp=message.get("timestamp"),
-                )
-                if getattr(mirror_result, "status", None) == "failed":
-                    logger.warning(
-                        "blackbox bridge append_messages_batch failed: "
-                        "session_id=%s platform_message_id=%s row_id=%s "
-                        "batch_index=%s reason=%s error_type=%s",
-                        session_id,
-                        platform_message_id,
-                        message_id,
-                        batch_index,
-                        getattr(mirror_result, "reason", "UNKNOWN"),
-                        getattr(mirror_result, "error_type", "UnknownError"),
-                    )
-            except Exception as exc:
-                logger.warning(
-                    "blackbox bridge append_messages_batch hook failed: "
-                    "session_id=%s platform_message_id=%s row_id=%s "
-                    "batch_index=%s error_type=%s",
-                    session_id,
-                    platform_message_id,
-                    message_id,
-                    batch_index,
-                    type(exc).__name__,
-                )
+        self._drain_blackbox_message_outbox_after_commit()
         return inserted
 
     def set_latest_matching_message_display_kind(

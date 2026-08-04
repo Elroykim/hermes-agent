@@ -40,6 +40,7 @@ class BlackboxRecordResult:
 
     status: Literal["recorded", "disabled", "failed"]
     event_id: str | None = None
+    receipt_payload_sha256: str | None = None
     reason: str | None = None
     error_type: str | None = None
 
@@ -50,6 +51,8 @@ class BlackboxRecordResult:
             raise ValueError("recorded result cannot contain failure metadata")
         if self.status != "recorded" and not self.reason:
             raise ValueError("non-recorded result requires a reason")
+        if self.status != "recorded" and self.receipt_payload_sha256 is not None:
+            raise ValueError("failed result cannot contain a durable receipt digest")
 
 
 @dataclass(frozen=True)
@@ -315,6 +318,7 @@ def record_session_message(
     platform_message_id: Optional[str] = None,
     observed: bool = False,
     timestamp: Any = None,
+    _durable_event_id: Optional[str] = None,
 ) -> BlackboxRecordResult:
     """Append one Hermes message to TheWon raw Blackbox, best-effort."""
     config = _resolve_config()
@@ -361,16 +365,54 @@ def record_session_message(
     else:
         event_type = "message"
 
+    event = {
+        "type": event_type,
+        "session": session_id,
+        "project": cfg.get("project"),
+        "tags": ["hermes", "session_db", "raw"],
+        "severity": "info",
+        "data": data,
+    }
+    if _durable_event_id is not None:
+        event["id"] = _durable_event_id
+        record_durable = getattr(recorder, "record_durable", None)
+        if not callable(record_durable):
+            return BlackboxRecordResult(
+                status="failed",
+                reason="DURABLE_API_UNAVAILABLE",
+                error_type="AttributeError",
+            )
+        try:
+            receipt = record_durable(
+                event,
+                session_id=session_id,
+                request_id=str(platform_message_id or message_id or session_id),
+            )
+            receipt_event_id = getattr(receipt, "event_id", None)
+            if receipt_event_id != _durable_event_id:
+                return BlackboxRecordResult(
+                    status="failed",
+                    reason="DURABLE_RECEIPT_MISMATCH",
+                    error_type="ValueError",
+                )
+            receipt_digest = getattr(receipt, "payload_sha256", None)
+            return BlackboxRecordResult(
+                status="recorded",
+                event_id=receipt_event_id,
+                receipt_payload_sha256=(
+                    receipt_digest if isinstance(receipt_digest, str) else None
+                ),
+            )
+        except Exception as exc:
+            return BlackboxRecordResult(
+                status="failed",
+                reason="RECORDER_WRITE_FAILED",
+                error_type=type(exc).__name__,
+            )
+
     try:
         event_id = recorder.record(
-            {
-                "type": event_type,
-                "session": session_id,
-                "project": cfg.get("project"),
-                "tags": ["hermes", "session_db", "raw"],
-                "severity": "info",
-                "data": data,
-            },
+            event,
             session_id=session_id,
             request_id=str(platform_message_id or message_id or session_id),
         )
