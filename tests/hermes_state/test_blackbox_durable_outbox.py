@@ -40,7 +40,7 @@ def _configure(monkeypatch, recorder) -> None:
 def _outbox_rows(db: SessionDB):
     return db._conn.execute(
         "SELECT event_id, message_id, payload_json, payload_sha256, status, "
-        "attempt_count, receiver_event_id, receiver_payload_sha256 "
+        "attempt_count, receiver_event_id, receiver_payload_sha256, last_error_type "
         "FROM blackbox_message_outbox ORDER BY id"
     ).fetchall()
 
@@ -144,6 +144,24 @@ def test_missing_receiver_api_keeps_pending_without_failing_session(
     assert rows[-1]["id"] == message_id
     assert outbox["status"] == "pending"
     assert outbox["attempt_count"] == 1
+
+
+def test_disabled_bridge_defers_outbox_without_retrying_or_marking_error(
+    monkeypatch, tmp_path
+):
+    _configure(monkeypatch, _DurableRecorder())
+    monkeypatch.setattr(bridge, "_load_cfg", lambda: {"enabled": False})
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        db.create_session("s1", "test")
+        db.append_message("s1", role="user", content="deferred")
+        row = _outbox_rows(db)[0]
+    finally:
+        db.close()
+
+    assert row["status"] == "pending"
+    assert row["attempt_count"] == 0
+    assert row["last_error_type"] is None
 
 
 def test_receiver_failure_reopens_and_auto_delivers_pending_once(monkeypatch, tmp_path):

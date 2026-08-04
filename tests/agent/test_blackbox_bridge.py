@@ -10,6 +10,7 @@ import threading
 from unittest.mock import MagicMock
 
 import agent.blackbox_bridge as bridge
+import pytest
 from hermes_state import SessionDB
 
 
@@ -19,6 +20,15 @@ def _result(status, **kwargs):
 
 def _durable_recorded(**kwargs):
     return _result("recorded", event_id=kwargs["_durable_event_id"])
+
+
+@pytest.fixture(autouse=True)
+def _enable_bridge_delivery_for_sessiondb_tests(monkeypatch):
+    monkeypatch.setattr(
+        bridge,
+        "_load_cfg",
+        lambda: {"enabled": True, "agent_id": "MINA", "project": "TheWon"},
+    )
 
 
 def _decode_canonical(node):
@@ -200,6 +210,11 @@ def test_config_failure_and_disabled_are_isolated_across_concurrent_calls(
         return None
 
     monkeypatch.setattr(config_module, "load_config", racing_load_config)
+    monkeypatch.setattr(
+        bridge,
+        "_load_cfg",
+        lambda: config_module.load_config().get("blackbox", {}),
+    )
     monkeypatch.setattr(bridge, "_get_recorder", coordinated_get_recorder)
 
     def invoke(label):

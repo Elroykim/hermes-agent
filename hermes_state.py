@@ -7717,6 +7717,17 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """Best-effort delivery of committed message outbox rows."""
         if self.read_only or limit <= 0:
             return 0
+        try:
+            from agent.blackbox_bridge import status as blackbox_status
+
+            if not bool(blackbox_status().get("enabled")):
+                logger.info("blackbox durable outbox deferred: bridge disabled")
+                return 0
+        except Exception:
+            # A diagnostic failure must not turn a configured bridge into a
+            # permanent no-op. The per-row delivery path retains its own
+            # fail-open error handling and observability.
+            pass
         with self._lock:
             pending = self._conn.execute(
                 "SELECT id, event_id, payload_json, payload_sha256 "
