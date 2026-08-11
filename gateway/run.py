@@ -2915,6 +2915,32 @@ def _dequeue_pending_event(adapter, session_key: str) -> MessageEvent | None:
     return adapter.get_pending_message(session_key)
 
 
+def _stable_event_identity(
+    source: SessionSource,
+    event_message_id: Optional[str],
+) -> Optional[tuple[str, str, str, str, str]]:
+    """Return a scoped inbound event identity when every required part exists."""
+    if source is None or event_message_id is None:
+        return None
+    platform = _gateway_platform_value(getattr(source, "platform", None))
+    chat_id = getattr(source, "chat_id", None)
+    normalized_event_id = str(event_message_id).strip()
+    if (
+        not platform
+        or chat_id is None
+        or not str(chat_id).strip()
+        or not normalized_event_id
+    ):
+        return None
+    return (
+        platform,
+        str(getattr(source, "scope_id", None) or ""),
+        str(chat_id),
+        str(getattr(source, "thread_id", None) or ""),
+        normalized_event_id,
+    )
+
+
 _INTERRUPT_REASON_STOP = "Stop requested"
 _INTERRUPT_REASON_RESET = "Session reset requested"
 _INTERRUPT_REASON_TIMEOUT = "Execution timed out (inactivity)"
@@ -26649,6 +26675,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             pending = None
             if result and adapter and session_key:
                 pending_event = _dequeue_pending_event(adapter, session_key)
+                active_event_identity = _stable_event_identity(source, event_message_id)
+                pending_event_identity = _stable_event_identity(
+                    getattr(pending_event, "source", None),
+                    self._reply_anchor_for_event(pending_event) if pending_event else None,
+                )
+                if (
+                    active_event_identity is not None
+                    and pending_event_identity == active_event_identity
+                ):
+                    logger.warning(
+                        "Discarding queued replay of active event for session %s",
+                        session_key,
+                    )
+                    pending_event = None
                 # /queue overflow: after consuming the adapter's "next-up"
                 # slot, promote the next queued event into it so the
                 # recursive run's drain will see it.  This keeps the slot

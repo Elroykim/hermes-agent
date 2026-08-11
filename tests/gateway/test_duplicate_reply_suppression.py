@@ -5,14 +5,17 @@ Covers four fix paths:
      pending message exists (#8221 / #2483)
   2. run.py return path: only confirmed final streamed delivery suppresses
      the fallback final send; partial streamed output must not
-  3. run.py queued-message path: first response is skipped only when the
-     final response was actually streamed, not merely when partial output existed
+  3. run.py queued-message path: same-event replays are discarded, and the
+     first response is skipped only when final delivery was actually confirmed
   4. stream_consumer.py cancellation handler: only confirms final delivery
      when the best-effort send actually succeeds, not merely because partial
      content was sent earlier
 """
 
 import asyncio
+import importlib
+import sys
+import types
 from types import SimpleNamespace
 
 import pytest
@@ -243,6 +246,168 @@ class TestQueuedMessageAlreadyStreamed:
         assert _already_streamed is True
 
 
+class QueuedReplayAdapter(BasePlatformAdapter):
+    """Slack adapter double that records terminal sends."""
+
+    def __init__(self):
+        super().__init__(PlatformConfig(enabled=True, token="fake"), Platform.SLACK)
+        self.sent = []
+
+    async def connect(self, *, is_reconnect: bool = False):
+        return True
+
+    async def disconnect(self):
+        pass
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None):
+        self.sent.append(
+            {
+                "chat_id": chat_id,
+                "content": content,
+                "reply_to": reply_to,
+                "metadata": metadata,
+            }
+        )
+        return SendResult(success=True, message_id=f"reply-{len(self.sent)}")
+
+    async def send_typing(self, chat_id, metadata=None):
+        pass
+
+    async def get_chat_info(self, chat_id):
+        return {"id": chat_id}
+
+
+class IdenticalTerminalReplyAgent:
+    calls = []
+
+    def __init__(self, **kwargs):
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        type(self).calls.append(message)
+        return {
+            "final_response": "Standing GV is complete.",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
+def _make_queued_replay_runner(adapter):
+    gateway_run = importlib.import_module("gateway.run")
+    runner = object.__new__(gateway_run.GatewayRunner)
+    runner.adapters = {adapter.platform: adapter}
+    runner._voice_mode = {}
+    runner._prefill_messages = []
+    runner._ephemeral_system_prompt = ""
+    runner._reasoning_config = None
+    runner._provider_routing = {}
+    runner._fallback_model = None
+    runner._session_db = None
+    runner._running_agents = {}
+    runner._session_run_generation = {}
+    runner.hooks = SimpleNamespace(loaded_hooks=False)
+    runner.config = SimpleNamespace(
+        thread_sessions_per_user=False,
+        group_sessions_per_user=False,
+        stt_enabled=False,
+    )
+    runner._model = "openai/gpt-4.1-mini"
+    runner._base_url = None
+    return runner
+
+
+async def _run_queued_replay_case(monkeypatch, tmp_path, pending_message_id):
+    IdenticalTerminalReplyAgent.calls = []
+
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = IdenticalTerminalReplyAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs",
+        lambda: {"api_key": "fake"},
+    )
+
+    adapter = QueuedReplayAdapter()
+    runner = _make_queued_replay_runner(adapter)
+    source = SessionSource(
+        platform=Platform.SLACK,
+        scope_id="T-WORKSPACE",
+        chat_id="C-GV",
+        chat_type="channel",
+        thread_id="1723456789.000100",
+    )
+    session_key = "agent:main:slack:channel:C-GV:1723456789.000100"
+    adapter._pending_messages[session_key] = MessageEvent(
+        text="Run standing GV",
+        source=source,
+        message_id=pending_message_id,
+    )
+
+    result = await runner._run_agent(
+        message="Run standing GV",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="sess-standing-gv",
+        session_key=session_key,
+        event_message_id="1723456789.000200",
+    )
+
+    # Model BasePlatformAdapter's normal terminal send after _run_agent returns.
+    if not result.get("already_sent"):
+        await adapter.send(
+            source.chat_id,
+            result["final_response"],
+            reply_to="1723456789.000200",
+            metadata={"thread_id": source.thread_id},
+        )
+    return adapter
+
+
+class TestQueuedSameEventReplaySuppression:
+    @pytest.mark.asyncio
+    async def test_same_scoped_event_queued_behind_itself_runs_once(
+        self, monkeypatch, tmp_path
+    ):
+        adapter = await _run_queued_replay_case(
+            monkeypatch,
+            tmp_path,
+            pending_message_id="1723456789.000200",
+        )
+
+        assert IdenticalTerminalReplyAgent.calls == ["Run standing GV"]
+        assert [item["content"] for item in adapter.sent] == [
+            "Standing GV is complete."
+        ]
+
+    @pytest.mark.asyncio
+    async def test_distinct_event_identity_with_identical_text_still_runs(
+        self, monkeypatch, tmp_path
+    ):
+        adapter = await _run_queued_replay_case(
+            monkeypatch,
+            tmp_path,
+            pending_message_id="1723456789.000201",
+        )
+
+        assert IdenticalTerminalReplyAgent.calls == [
+            "Run standing GV",
+            "Run standing GV",
+        ]
+        assert [item["content"] for item in adapter.sent] == [
+            "Standing GV is complete.",
+            "Standing GV is complete.",
+        ]
+
+
 # ===================================================================
 # Test 4: stream_consumer.py — cancellation handler delivery confirmation
 # ===================================================================
@@ -319,4 +484,3 @@ class TestFinalContentDeliveredSuppression:
             response["already_sent"] = True
 
         assert response.get("already_sent") is True
-
