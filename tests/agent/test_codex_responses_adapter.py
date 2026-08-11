@@ -331,6 +331,94 @@ def test_chat_messages_to_responses_input_keeps_short_call_id():
     assert output["call_id"] == "call_abc123"
 
 
+@pytest.mark.parametrize(
+    "invalid_name",
+    [
+        "mcp.codex_apps.slack.slack_read_thread",
+        "slash/name",
+        "contains space",
+        "unicode-name-é",
+        "",
+        None,
+    ],
+)
+def test_chat_history_skips_invalid_function_call_and_paired_output(invalid_name):
+    messages = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "call_id": "call_invalid",
+                    "function": {"name": invalid_name, "arguments": "{}"},
+                },
+                {
+                    "call_id": "call_valid",
+                    "function": {"name": "slack_read_thread", "arguments": "{}"},
+                },
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_invalid", "content": "drop this"},
+        {"role": "tool", "tool_call_id": "call_valid", "content": "keep this"},
+    ]
+
+    items = _chat_messages_to_responses_input(messages)
+
+    assert items == [
+        {
+            "type": "function_call",
+            "call_id": "call_valid",
+            "name": "slack_read_thread",
+            "arguments": "{}",
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "call_valid",
+            "output": "keep this",
+        },
+    ]
+
+
+def test_chat_history_keeps_orphan_output_when_no_invalid_call_owns_it():
+    items = _chat_messages_to_responses_input(
+        [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "call_id": "call_invalid",
+                        "function": {"name": "mcp.bad.tool", "arguments": "{}"},
+                    },
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_other", "content": "orphan"},
+        ]
+    )
+
+    assert items == [
+        {
+            "type": "function_call_output",
+            "call_id": "call_other",
+            "output": "orphan",
+        },
+    ]
+
+
+def test_preflight_rejects_invalid_function_call_name():
+    with pytest.raises(ValueError, match="invalid name"):
+        _preflight_codex_input_items(
+            [
+                {
+                    "type": "function_call",
+                    "call_id": "call_invalid",
+                    "name": "mcp.codex_apps.slack.slack_read_thread",
+                    "arguments": "{}",
+                }
+            ]
+        )
+
+
 
 
 

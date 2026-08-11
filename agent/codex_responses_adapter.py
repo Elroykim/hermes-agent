@@ -74,6 +74,14 @@ _TOOL_CALL_LEAK_PATTERN = re.compile(
 )
 
 
+_RESPONSES_FUNCTION_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def _is_valid_responses_function_name(value: Any) -> bool:
+    """Return whether ``value`` is valid for Responses ``function_call.name``."""
+    return isinstance(value, str) and bool(_RESPONSES_FUNCTION_NAME_RE.fullmatch(value))
+
+
 # The ChatGPT Codex backend reserves these Harmony wire tokens. If their
 # literal spellings are replayed anywhere in request text, the backend rejects
 # the request before inference with ``invalid_prompt: Request blocked.``.
@@ -461,6 +469,7 @@ def _chat_messages_to_responses_input(
     """
     items: List[Dict[str, Any]] = []
     seen_item_ids: set = set()
+    excluded_tool_call_ids: set = set()
 
     for msg in messages:
         if not isinstance(msg, dict):
@@ -612,9 +621,9 @@ def _chat_messages_to_responses_input(
                         if not isinstance(tc, dict):
                             continue
                         fn = tc.get("function", {})
+                        if not isinstance(fn, dict):
+                            fn = {}
                         fn_name = fn.get("name")
-                        if not isinstance(fn_name, str) or not fn_name.strip():
-                            continue
 
                         embedded_call_id, embedded_response_item_id = _split_responses_tool_id(
                             tc.get("id")
@@ -631,8 +640,20 @@ def _chat_messages_to_responses_input(
                                 call_id = f"call_{embedded_response_item_id[len('fc_'):]}"
                             else:
                                 _raw_args = str(fn.get("arguments", "{}"))
-                                call_id = _deterministic_call_id(fn_name, _raw_args, len(items))
+                                call_id = _deterministic_call_id(
+                                    fn_name if isinstance(fn_name, str) else "",
+                                    _raw_args,
+                                    len(items),
+                                )
                         call_id = call_id.strip()
+                        clamped_call_id = _clamp_responses_call_id(call_id)
+
+                        if not _is_valid_responses_function_name(fn_name):
+                            # The Responses API rejects dotted MCP history names.
+                            # Do not rename a stored call: exclude its matching
+                            # output as well so replay preserves call/output pairing.
+                            excluded_tool_call_ids.add(clamped_call_id)
+                            continue
 
                         arguments = fn.get("arguments", "{}")
                         if isinstance(arguments, dict):
@@ -643,7 +664,7 @@ def _chat_messages_to_responses_input(
 
                         items.append({
                             "type": "function_call",
-                            "call_id": _clamp_responses_call_id(call_id),
+                            "call_id": clamped_call_id,
                             "name": fn_name,
                             "arguments": arguments,
                         })
@@ -664,6 +685,9 @@ def _chat_messages_to_responses_input(
                 if isinstance(raw_tool_call_id, str) and raw_tool_call_id.strip():
                     call_id = raw_tool_call_id.strip()
             if not isinstance(call_id, str) or not call_id.strip():
+                continue
+            clamped_call_id = _clamp_responses_call_id(call_id.strip())
+            if clamped_call_id in excluded_tool_call_ids:
                 continue
 
             # Multimodal tool result: convert OpenAI-style content list into
@@ -686,7 +710,7 @@ def _chat_messages_to_responses_input(
 
             items.append({
                 "type": "function_call_output",
-                "call_id": _clamp_responses_call_id(call_id),
+                "call_id": clamped_call_id,
                 "output": output_value,
             })
 
@@ -725,6 +749,10 @@ def _preflight_codex_input_items(
                 raise ValueError(f"Codex Responses input[{idx}] function_call is missing call_id.")
             if not isinstance(name, str) or not name.strip():
                 raise ValueError(f"Codex Responses input[{idx}] function_call is missing name.")
+            if not _is_valid_responses_function_name(name):
+                raise ValueError(
+                    f"Codex Responses input[{idx}] function_call has invalid name."
+                )
 
             arguments = item.get("arguments", "{}")
             if isinstance(arguments, dict):
