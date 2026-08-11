@@ -108,6 +108,11 @@ _EXACT_LINE_CONTRACT_RE = re.compile(
     re.MULTILINE,
 )
 _MAX_EXACT_LINE_CONTRACT_CHARS = 4096
+_EXACT_LINE_CONTRACT_SYSTEM = (
+    "Complete the explicit Slack terminal contract below. Return exactly the "
+    "expected line and nothing else. Do not call tools, explain, quote, or add "
+    "formatting."
+)
 
 
 def _extract_exact_line_contract(user_message: Any) -> Optional[str]:
@@ -125,6 +130,29 @@ def _extract_exact_line_contract(user_message: Any) -> Optional[str]:
 
 def _exact_line_contract_sha256(expected: str) -> str:
     return hashlib.sha256(expected.encode("utf-8")).hexdigest()
+
+
+def _exact_line_contract_api_messages(expected: str) -> List[Dict[str, str]]:
+    """Build the complete provider prompt for a verified terminal contract."""
+    return [
+        {"role": "system", "content": _EXACT_LINE_CONTRACT_SYSTEM},
+        {
+            "role": "user",
+            "content": "Return exactly this terminal line and nothing else:\n" + expected,
+        },
+    ]
+
+
+def _enforce_exact_line_contract_payload(
+    payload: Dict[str, Any], expected: str
+) -> None:
+    """Reassert the bounded contract at the final request boundaries."""
+    if isinstance(payload.get("messages"), list):
+        payload["messages"] = _exact_line_contract_api_messages(expected)
+    if isinstance(payload.get("input"), list):
+        payload["input"] = _exact_line_contract_api_messages(expected)
+    payload.pop("tools", None)
+    payload.pop("tool_choice", None)
 
 
 def _drop_exact_line_contract_scaffolding(messages: List[Dict[str, Any]]) -> None:
@@ -2094,6 +2122,16 @@ def run_conversation(
             logger=request_logger,
         )
 
+        if exact_line_contract is not None:
+            # A terminal receipt is deliberately independent of the thread's
+            # accumulated conversation. Replaying unrelated Slack history made
+            # one-line receipts inherit tens of thousands of tokens and hit the
+            # provider stale-call cutoff. Keep persistence untouched while the
+            # provider sees only this bounded, contract-derived prompt.
+            api_messages = _exact_line_contract_api_messages(
+                exact_line_contract
+            )
+
         # Safety net: strip orphaned tool results / add stubs for missing
         # results before sending to the API.  Runs unconditionally — not
         # gated on context_compressor — so orphans from session loading or
@@ -2605,11 +2643,12 @@ def run_conversation(
 
                 if exact_line_contract is not None:
                     # This protocol is a terminal-only Slack receipt. Neither
-                    # the model nor request middleware may turn it into a tool
-                    # execution path.
+                    # the model nor request middleware may reintroduce thread
+                    # history or turn it into a tool execution path.
                     for payload in (api_kwargs, _original_api_kwargs):
-                        payload.pop("tools", None)
-                        payload.pop("tool_choice", None)
+                        _enforce_exact_line_contract_payload(
+                            payload, exact_line_contract
+                        )
 
                 try:
                     from hermes_cli.lifecycle import (
@@ -2733,6 +2772,10 @@ def run_conversation(
                         _use_streaming = False
 
                 def _perform_api_call(next_api_kwargs):
+                    if exact_line_contract is not None:
+                        _enforce_exact_line_contract_payload(
+                            next_api_kwargs, exact_line_contract
+                        )
                     if agent.api_mode == "codex_responses":
                         next_api_kwargs = agent._get_transport().preflight_kwargs(
                             next_api_kwargs,
