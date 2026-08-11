@@ -57,6 +57,14 @@ def _classify_responses_issuer(
 _CROSS_ISSUER_WARN_EMITTED = False
 
 
+_RESPONSES_FUNCTION_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def _is_valid_responses_function_name(value: Any) -> bool:
+    """Return whether ``value`` is valid for Responses ``function_call.name``."""
+    return isinstance(value, str) and bool(_RESPONSES_FUNCTION_NAME_RE.fullmatch(value))
+
+
 # Matches Codex/Harmony tool-call serialization that occasionally leaks into
 # assistant-message content when the model fails to emit a structured
 # ``function_call`` item.  Accepts the common forms:
@@ -305,6 +313,65 @@ def _split_responses_tool_id(raw_id: Any) -> tuple[Optional[str], Optional[str]]
     return value, None
 
 
+def _replay_explicit_tool_call_id(tool_call: Dict[str, Any]) -> Optional[str]:
+    """Return an explicitly persisted replay call ID, if one can be paired.
+
+    Missing IDs deliberately stay unpaired.  Inventing an ID during the
+    pre-scan could remove an unrelated orphan output that uses the same
+    generated value.
+    """
+    embedded_call_id, embedded_response_item_id = _split_responses_tool_id(
+        tool_call.get("id")
+    )
+    call_id = tool_call.get("call_id")
+    if not isinstance(call_id, str) or not call_id.strip():
+        call_id = embedded_call_id
+    if not isinstance(call_id, str) or not call_id.strip():
+        if (
+            isinstance(embedded_response_item_id, str)
+            and embedded_response_item_id.startswith("fc_")
+            and len(embedded_response_item_id) > len("fc_")
+        ):
+            call_id = "call_" + embedded_response_item_id[len("fc_"):]
+        else:
+            return None
+    return _clamp_responses_call_id(call_id.strip())
+
+
+def _excluded_historical_tool_call_ids(messages: List[Dict[str, Any]]) -> set[str]:
+    """Find invalid or ambiguous persisted tool-call IDs before replay.
+
+    The Responses API rejects an invalid function name after prior history has
+    been serialized.  Scan the complete history first so a paired output is
+    never emitted merely because it appeared before the bad call.  Duplicate
+    IDs are ambiguous and therefore excluded as well; unrelated IDs continue
+    to replay normally.
+    """
+    counts: Dict[str, int] = {}
+    invalid_ids: set[str] = set()
+
+    for message in messages:
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        tool_calls = message.get("tool_calls")
+        if not isinstance(tool_calls, list):
+            continue
+        for tool_call in tool_calls:
+            if not isinstance(tool_call, dict):
+                continue
+            call_id = _replay_explicit_tool_call_id(tool_call)
+            if call_id is None:
+                continue
+            counts[call_id] = counts.get(call_id, 0) + 1
+            function = tool_call.get("function")
+            name = function.get("name") if isinstance(function, dict) else None
+            if not _is_valid_responses_function_name(name):
+                invalid_ids.add(call_id)
+
+    duplicate_ids = {call_id for call_id, count in counts.items() if count > 1}
+    return invalid_ids | duplicate_ids
+
+
 def _derive_responses_function_call_id(
     call_id: str,
     response_item_id: Optional[str] = None,
@@ -461,6 +528,7 @@ def _chat_messages_to_responses_input(
     """
     items: List[Dict[str, Any]] = []
     seen_item_ids: set = set()
+    excluded_tool_call_ids = _excluded_historical_tool_call_ids(messages)
 
     for msg in messages:
         if not isinstance(msg, dict):
@@ -612,9 +680,9 @@ def _chat_messages_to_responses_input(
                         if not isinstance(tc, dict):
                             continue
                         fn = tc.get("function", {})
+                        if not isinstance(fn, dict):
+                            fn = {}
                         fn_name = fn.get("name")
-                        if not isinstance(fn_name, str) or not fn_name.strip():
-                            continue
 
                         embedded_call_id, embedded_response_item_id = _split_responses_tool_id(
                             tc.get("id")
@@ -631,8 +699,18 @@ def _chat_messages_to_responses_input(
                                 call_id = f"call_{embedded_response_item_id[len('fc_'):]}"
                             else:
                                 _raw_args = str(fn.get("arguments", "{}"))
-                                call_id = _deterministic_call_id(fn_name, _raw_args, len(items))
+                                call_id = _deterministic_call_id(
+                                    fn_name if isinstance(fn_name, str) else "",
+                                    _raw_args,
+                                    len(items),
+                                )
                         call_id = call_id.strip()
+                        clamped_call_id = _clamp_responses_call_id(call_id)
+                        if (
+                            not _is_valid_responses_function_name(fn_name)
+                            or clamped_call_id in excluded_tool_call_ids
+                        ):
+                            continue
 
                         arguments = fn.get("arguments", "{}")
                         if isinstance(arguments, dict):
@@ -643,7 +721,7 @@ def _chat_messages_to_responses_input(
 
                         items.append({
                             "type": "function_call",
-                            "call_id": _clamp_responses_call_id(call_id),
+                            "call_id": clamped_call_id,
                             "name": fn_name,
                             "arguments": arguments,
                         })
@@ -664,6 +742,9 @@ def _chat_messages_to_responses_input(
                 if isinstance(raw_tool_call_id, str) and raw_tool_call_id.strip():
                     call_id = raw_tool_call_id.strip()
             if not isinstance(call_id, str) or not call_id.strip():
+                continue
+            clamped_call_id = _clamp_responses_call_id(call_id.strip())
+            if clamped_call_id in excluded_tool_call_ids:
                 continue
 
             # Multimodal tool result: convert OpenAI-style content list into
@@ -686,7 +767,7 @@ def _chat_messages_to_responses_input(
 
             items.append({
                 "type": "function_call_output",
-                "call_id": _clamp_responses_call_id(call_id),
+                "call_id": clamped_call_id,
                 "output": output_value,
             })
 
@@ -725,6 +806,10 @@ def _preflight_codex_input_items(
                 raise ValueError(f"Codex Responses input[{idx}] function_call is missing call_id.")
             if not isinstance(name, str) or not name.strip():
                 raise ValueError(f"Codex Responses input[{idx}] function_call is missing name.")
+            if not _is_valid_responses_function_name(name):
+                raise ValueError(
+                    f"Codex Responses input[{idx}] function_call has invalid name."
+                )
 
             arguments = item.get("arguments", "{}")
             if isinstance(arguments, dict):
