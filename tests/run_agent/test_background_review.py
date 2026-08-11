@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import run_agent as run_agent_module
+from agent.background_review import BackgroundReviewLifecycle
 from run_agent import AIAgent
 
 
@@ -141,9 +142,13 @@ def test_background_review_registers_on_active_children_for_interrupt(monkeypatc
 
         def run_conversation(self, **kwargs):
             # While run_conversation is "in flight", both tracking slots on
-            # the parent must already point at this fork.
+            # the parent must already point at the lifecycle that owns this fork.
+            seen["review_agent_during_run"] = self
             seen["active_children_during_run"] = list(agent._active_children)
             seen["background_review_agent_during_run"] = agent._background_review_agent
+            seen["lifecycle_review_agent_during_run"] = (
+                agent._active_children[0].review_agent
+            )
 
         def shutdown_memory_provider(self):
             pass
@@ -162,15 +167,52 @@ def test_background_review_registers_on_active_children_for_interrupt(monkeypatc
         review_memory=True,
     )
 
-    fork = seen["background_review_agent_during_run"]
-    assert fork is not None
-    assert seen["active_children_during_run"] == [fork]
+    lifecycle = seen["background_review_agent_during_run"]
+    assert lifecycle is seen["active_children_during_run"][0]
+    assert len(seen["active_children_during_run"]) == 1
+    assert seen["lifecycle_review_agent_during_run"] is seen["review_agent_during_run"]
 
     # After the review completes, both tracking slots must be cleared —
     # otherwise a later interrupt() would try to cancel an already-closed
     # agent, or the next turn would wait on a review that no longer exists.
     assert agent._background_review_agent is None
     assert agent._active_children == []
+
+
+def test_background_review_publication_is_linearized_with_cancel():
+    lifecycle = BackgroundReviewLifecycle()
+    callback_started = __import__("threading").Event()
+    release_callback = __import__("threading").Event()
+    cancel_returned = __import__("threading").Event()
+    events = []
+
+    def publish():
+        def callback():
+            events.append("callback-start")
+            callback_started.set()
+            assert release_callback.wait(2)
+            events.append("callback-end")
+
+        assert lifecycle.run_if_active(callback) is True
+
+    publisher = __import__("threading").Thread(target=publish)
+    publisher.start()
+    assert callback_started.wait(2)
+
+    def cancel():
+        lifecycle.cancel("stop")
+        events.append("cancel-return")
+        cancel_returned.set()
+
+    canceller = __import__("threading").Thread(target=cancel)
+    canceller.start()
+    assert cancel_returned.wait(0.05) is False
+    release_callback.set()
+    publisher.join(2)
+    canceller.join(2)
+
+    assert events == ["callback-start", "callback-end", "cancel-return"]
+    assert lifecycle.run_if_active(lambda: events.append("late")) is False
 
 
 def test_new_live_turn_cancels_still_running_background_review(monkeypatch):
@@ -201,6 +243,43 @@ def test_new_live_turn_cancels_still_running_background_review(monkeypatch):
     _pending_review.interrupt("superseded by a new live turn")
 
     assert calls == ["superseded by a new live turn"]
+
+
+def test_background_review_is_owned_before_thread_start(monkeypatch):
+    """Eviction between ``Thread.start`` and worker entry must cancel review.
+
+    The lifecycle handle has to be registered synchronously.  Registering only
+    the forked AIAgent inside the worker leaves a race where cache eviction can
+    release the parent before there is anything to interrupt.
+    """
+    constructed = []
+
+    class FakeReviewAgent:
+        def __init__(self, **kwargs):
+            constructed.append(kwargs)
+
+    agent = _bare_agent()
+
+    class EvictBeforeWorkerThread:
+        def __init__(self, *, target, daemon=None, name=None):
+            self._target = target
+
+        def start(self):
+            agent.release_clients()
+            self._target()
+
+    monkeypatch.setattr(run_agent_module, "AIAgent", FakeReviewAgent)
+    monkeypatch.setattr(run_agent_module.threading, "Thread", EvictBeforeWorkerThread)
+
+    AIAgent._spawn_background_review(
+        agent,
+        messages_snapshot=[{"role": "user", "content": "hello"}],
+        review_memory=True,
+    )
+
+    assert constructed == []
+    assert agent._active_children == []
+    assert agent._background_review_agent is None
 
 
 

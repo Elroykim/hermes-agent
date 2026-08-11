@@ -1817,21 +1817,79 @@ class AIAgent:
         appended to the review prompt — e.g. "save the deploy workflow as a
         skill". The automatic post-turn triggers never set it.
         """
-        from agent.background_review import spawn_background_review_thread
+        from agent.background_review import (
+            BackgroundReviewLifecycle,
+            spawn_background_review_thread,
+        )
         from tools.thread_context import propagate_context_to_thread
+
+        previous = getattr(self, "_background_review_handle", None)
+        if previous is not None and not getattr(previous, "done", True):
+            previous.hard_interrupt("superseded by a newer background review")
+
+        def _review_done(handle) -> None:
+            lock = getattr(self, "_background_review_lock", None)
+            if lock is not None:
+                with lock:
+                    if getattr(self, "_background_review_handle", None) is handle:
+                        self._background_review_handle = None
+                    if getattr(self, "_background_review_agent", None) is handle:
+                        self._background_review_agent = None
+            else:
+                if getattr(self, "_background_review_handle", None) is handle:
+                    self._background_review_handle = None
+                if getattr(self, "_background_review_agent", None) is handle:
+                    self._background_review_agent = None
+            children_lock = getattr(self, "_active_children_lock", None)
+            children = getattr(self, "_active_children", None)
+            if children_lock is not None and isinstance(children, list):
+                with children_lock:
+                    if handle in children:
+                        children.remove(handle)
+            callback = getattr(self, "background_review_lifecycle_callback", None)
+            if callable(callback):
+                callback("complete", handle)
+
+        lifecycle = BackgroundReviewLifecycle(on_done=_review_done)
+        lock = getattr(self, "_background_review_lock", None)
+        if lock is not None:
+            with lock:
+                self._background_review_handle = lifecycle
+                self._background_review_agent = lifecycle
+        else:
+            self._background_review_handle = lifecycle
+            self._background_review_agent = lifecycle
+        children_lock = getattr(self, "_active_children_lock", None)
+        children = getattr(self, "_active_children", None)
+        if children_lock is not None and isinstance(children, list):
+            with children_lock:
+                children.append(lifecycle)
+
+        lifecycle_callback = getattr(self, "background_review_lifecycle_callback", None)
+        if callable(lifecycle_callback):
+            try:
+                lifecycle_callback("register", lifecycle)
+            except Exception:
+                lifecycle.cancel("background review ownership registration failed")
         target, _prompt = spawn_background_review_thread(
             self,
             messages_snapshot,
             review_memory=review_memory,
             review_skills=review_skills,
             focus=focus,
+            lifecycle=lifecycle,
         )
         # Carry the active profile into the review thread so MEMORY.md / skill
         # review writes land in the right profile (#54937).
         t = threading.Thread(
             target=propagate_context_to_thread(target), daemon=True, name="bg-review"
         )
-        t.start()
+        try:
+            t.start()
+        except Exception:
+            lifecycle.cancel("background review thread failed to start")
+            lifecycle.finish()
+            raise
 
     def _build_memory_write_metadata(
         self,

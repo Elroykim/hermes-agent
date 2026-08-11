@@ -331,6 +331,154 @@ def test_chat_messages_to_responses_input_keeps_short_call_id():
     assert output["call_id"] == "call_abc123"
 
 
+@pytest.mark.parametrize("output_first", [False, True])
+def test_chat_history_drops_output_paired_with_invalid_function_regardless_of_order(output_first):
+    invalid_call = {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+            {
+                "call_id": "call_invalid",
+                "function": {
+                    "name": "mcp.codex_apps.slack.slack_read_thread",
+                    "arguments": "{}",
+                },
+            },
+            {
+                "call_id": "call_valid",
+                "function": {"name": "slack_read_thread", "arguments": "{}"},
+            },
+        ],
+    }
+    invalid_output = {
+        "role": "tool",
+        "tool_call_id": "call_invalid",
+        "content": "drop this",
+    }
+    valid_output = {
+        "role": "tool",
+        "tool_call_id": "call_valid",
+        "content": "keep this",
+    }
+    messages = [invalid_output, invalid_call, valid_output] if output_first else [
+        invalid_call,
+        invalid_output,
+        valid_output,
+    ]
+
+    items = _chat_messages_to_responses_input(messages)
+
+    assert items == [
+        {
+            "type": "function_call",
+            "call_id": "call_valid",
+            "name": "slack_read_thread",
+            "arguments": "{}",
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "call_valid",
+            "output": "keep this",
+        },
+    ]
+
+
+def test_chat_history_drops_duplicate_or_invalid_colliding_call_id_but_keeps_unrelated_data():
+    items = _chat_messages_to_responses_input(
+        [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "call_id": "call_collision",
+                        "function": {"name": "mcp.invalid.name", "arguments": "{}"},
+                    },
+                    {
+                        "call_id": "call_collision",
+                        "function": {"name": "valid_name", "arguments": "{}"},
+                    },
+                    {
+                        "call_id": "call_duplicate",
+                        "function": {"name": "first_valid", "arguments": "{}"},
+                    },
+                    {
+                        "call_id": "call_duplicate",
+                        "function": {"name": "second_valid", "arguments": "{}"},
+                    },
+                    {
+                        "call_id": "call_unrelated",
+                        "function": {"name": "kept_call", "arguments": "{}"},
+                    },
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_collision", "content": "drop"},
+            {"role": "tool", "tool_call_id": "call_duplicate", "content": "drop"},
+            {"role": "tool", "tool_call_id": "call_unrelated", "content": "keep"},
+            {"role": "tool", "tool_call_id": "call_orphan", "content": "orphan"},
+            {"role": "tool", "tool_call_id": {"malformed": True}, "content": "ignore"},
+        ]
+    )
+
+    assert items == [
+        {
+            "type": "function_call",
+            "call_id": "call_unrelated",
+            "name": "kept_call",
+            "arguments": "{}",
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "call_unrelated",
+            "output": "keep",
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "call_orphan",
+            "output": "orphan",
+        },
+    ]
+
+
+def test_chat_history_drops_repeated_invalid_call_id_and_all_matching_outputs():
+    items = _chat_messages_to_responses_input(
+        [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "call_id": "call_invalid",
+                        "function": {"name": "mcp.invalid.one", "arguments": "{}"},
+                    },
+                    {
+                        "call_id": "call_invalid",
+                        "function": {"name": "mcp.invalid.two", "arguments": "{}"},
+                    },
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_invalid", "content": "first"},
+            {"role": "tool", "tool_call_id": "call_invalid", "content": "second"},
+        ]
+    )
+
+    assert items == []
+
+
+def test_preflight_rejects_invalid_function_call_name():
+    with pytest.raises(ValueError, match="invalid name"):
+        _preflight_codex_input_items(
+            [
+                {
+                    "type": "function_call",
+                    "call_id": "call_invalid",
+                    "name": "mcp.codex_apps.slack.slack_read_thread",
+                    "arguments": "{}",
+                }
+            ]
+        )
+
+
 
 
 

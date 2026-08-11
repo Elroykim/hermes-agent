@@ -1389,6 +1389,9 @@ class GatewaySlashCommandsMixin:
         # a different key.  Authorized users should still be able to /stop it
         # (#bernard-thread-stop).  Fall back to interrupting any running
         # agent(s) that share this thread, gated on authorization.
+        own_auxiliary_cancelled = self._cancel_auxiliary_work(
+            session_key, _INTERRUPT_REASON_STOP
+        )
         sibling_keys = self._sibling_thread_run_keys(source, session_key)
         if sibling_keys and self._is_user_authorized(source):
             for sibling_key in sibling_keys:
@@ -1403,6 +1406,13 @@ class GatewaySlashCommandsMixin:
                 session_key,
                 len(sibling_keys),
                 ", ".join(sibling_keys),
+            )
+            return EphemeralReply(t("gateway.stop.stopped"))
+
+        if own_auxiliary_cancelled:
+            logger.info(
+                "STOP (auxiliary) for session %s — background work interrupted",
+                session_key,
             )
             return EphemeralReply(t("gateway.stop.stopped"))
 

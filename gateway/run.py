@@ -5136,6 +5136,11 @@ class TurnRunner:
             _deliver_bg_review_message(message)
 
         agent.background_review_callback = _bg_review_send
+        agent.background_review_lifecycle_callback = (
+            lambda event, handle: self._runner._on_background_review_lifecycle(
+                ctx.session_key, event, handle
+            )
+        )
         # Register the release hook on the adapter so base.py's finally
         # block can fire it after delivering the main response.
         if ctx._status_adapter and ctx.session_key:
@@ -6206,6 +6211,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         import threading as _threading
         self._agent_cache: "OrderedDict[str, tuple]" = OrderedDict()
         self._agent_cache_lock = _threading.Lock()
+        # Session-owned auxiliary work survives AIAgent cache replacement.
+        # Background review handles register before their worker threads start,
+        # so /stop and shutdown drain retain ownership across eviction races.
+        self._auxiliary_work: Dict[str, Dict[int, Any]] = {}
+        self._auxiliary_work_lock = _threading.Lock()
 
         # Conversation-scoped per-session state (/model, /model --once,
         # /reasoning, /fast overrides; per-turn sidecar notes; ephemeral
@@ -7580,12 +7590,88 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     def _running_agent_count(self) -> int:
         return len(self._running_agents)
 
+    def _register_auxiliary_work(self, session_key: str, handle: Any) -> None:
+        lock = getattr(self, "_auxiliary_work_lock", None)
+        registry = getattr(self, "_auxiliary_work", None)
+        if lock is None or registry is None or not session_key:
+            return
+        with lock:
+            registry.setdefault(session_key, {})[id(handle)] = handle
+        self._persist_active_agents()
+
+    def _complete_auxiliary_work(self, session_key: str, handle: Any) -> None:
+        lock = getattr(self, "_auxiliary_work_lock", None)
+        registry = getattr(self, "_auxiliary_work", None)
+        if lock is None or registry is None or not session_key:
+            return
+        with lock:
+            owned = registry.get(session_key)
+            if owned is not None and owned.get(id(handle)) is handle:
+                owned.pop(id(handle), None)
+                if not owned:
+                    registry.pop(session_key, None)
+        self._persist_active_agents()
+
+    def _on_background_review_lifecycle(
+        self, session_key: str, event: str, handle: Any
+    ) -> None:
+        if event == "register":
+            self._register_auxiliary_work(session_key, handle)
+        elif event == "complete":
+            self._complete_auxiliary_work(session_key, handle)
+
+    def _active_auxiliary_work_count(self) -> int:
+        lock = getattr(self, "_auxiliary_work_lock", None)
+        registry = getattr(self, "_auxiliary_work", None)
+        if lock is None or registry is None:
+            return 0
+        with lock:
+            return sum(
+                1
+                for owned in registry.values()
+                for handle in owned.values()
+                if not getattr(handle, "done", False)
+            )
+
+    def _cancel_auxiliary_work(self, session_key: str, reason: str) -> int:
+        lock = getattr(self, "_auxiliary_work_lock", None)
+        registry = getattr(self, "_auxiliary_work", None)
+        if lock is None or registry is None:
+            return 0
+        with lock:
+            handles = list(registry.get(session_key, {}).values())
+        cancelled = 0
+        for handle in handles:
+            try:
+                if handle.cancel(reason):
+                    cancelled += 1
+            except Exception:
+                logger.debug("Failed cancelling auxiliary work", exc_info=True)
+        return cancelled
+
+    def _cancel_all_auxiliary_work(self, reason: str) -> int:
+        lock = getattr(self, "_auxiliary_work_lock", None)
+        registry = getattr(self, "_auxiliary_work", None)
+        if lock is None or registry is None:
+            return 0
+        with lock:
+            handles = [handle for owned in registry.values() for handle in owned.values()]
+        cancelled = 0
+        for handle in handles:
+            try:
+                if handle.cancel(reason):
+                    cancelled += 1
+            except Exception:
+                logger.debug("Failed cancelling auxiliary work", exc_info=True)
+        return cancelled
+
     def _active_work_count(self) -> int:
         """All agent work the gateway must expose and drain as one total."""
         return (
             self._running_agent_count()
             + self._active_cron_job_count()
             + self._active_api_run_count()
+            + self._active_auxiliary_work_count()
         )
 
     def _active_cron_job_count(self) -> int:
@@ -9491,25 +9577,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         last_active_count = self._running_agent_count()
         last_cron_count = self._active_cron_job_count()
         last_api_count = self._active_api_run_count()
+        last_aux_count = self._active_auxiliary_work_count()
         last_status_at = 0.0
 
         def _maybe_update_status(force: bool = False) -> None:
-            nonlocal last_active_count, last_cron_count, last_api_count, last_status_at
+            nonlocal last_active_count, last_cron_count, last_api_count
+            nonlocal last_aux_count, last_status_at
             now = asyncio.get_running_loop().time()
             active_count = self._running_agent_count()
             cron_count = self._active_cron_job_count()
             api_count = self._active_api_run_count()
+            aux_count = self._active_auxiliary_work_count()
             if (
                 force
                 or active_count != last_active_count
                 or cron_count != last_cron_count
                 or api_count != last_api_count
+                or aux_count != last_aux_count
                 or (now - last_status_at) >= 1.0
             ):
                 self._update_runtime_status("draining")
                 last_active_count = active_count
                 last_cron_count = cron_count
                 last_api_count = api_count
+                last_aux_count = aux_count
                 last_status_at = now
 
         # Cron jobs run on the scheduler's own thread pool, outside
@@ -9518,7 +9609,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # or a cron job's tool work gets killed with zero warning the
         # instant it's the only active thing running (#60432).
         # API-server / desk sessions have the same structural gap (#63529).
-        if not self._running_agents and last_cron_count == 0 and last_api_count == 0:
+        if (
+            not self._running_agents
+            and last_cron_count == 0
+            and last_api_count == 0
+            and last_aux_count == 0
+        ):
             _maybe_update_status(force=True)
             return snapshot, False
 
@@ -9532,6 +9628,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 len(self._running_agents)
                 or self._active_cron_job_count()
                 or self._active_api_run_count()
+                or self._active_auxiliary_work_count()
             )
             and asyncio.get_running_loop().time() < deadline
         ):
@@ -9541,6 +9638,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             bool(len(self._running_agents))
             or bool(self._active_cron_job_count())
             or bool(self._active_api_run_count())
+            or bool(self._active_auxiliary_work_count())
         )
         _maybe_update_status(force=True)
         return snapshot, timed_out
@@ -9560,6 +9658,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         interrupted_api = self._interrupt_api_server_runs(reason)
         if interrupted_api:
             logger.debug("Interrupted %d api_server run(s) during shutdown", interrupted_api)
+        self._cancel_all_auxiliary_work(reason)
 
     async def _notify_active_sessions_of_shutdown(self) -> None:
         """Send shutdown/restart notifications to active chats and home channels.
@@ -19174,16 +19273,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
 
     def _sibling_thread_run_keys(self, source: SessionSource, own_key: str) -> list:
-        """Find running-agent keys for OTHER participants in the same thread.
+        """Find active work keys for OTHER participants in the same thread.
 
         Only applies when the message originates in a thread.  In per-user
         thread mode (``thread_sessions_per_user=True``) each participant gets
         an isolated session key of the form
         ``agent:main:{platform}:{chat_type}:{chat_id}:{thread_id}:{user_id}``,
         so a run started by another user is invisible to the caller's own
-        ``/stop``.  This returns the keys of any *actually running* agents
-        (not the pending sentinel, not the caller's own key) whose key shares
-        the caller's ``{chat_id}:{thread_id}`` prefix.
+        ``/stop``. This returns keys for foreground agents and session-owned
+        auxiliary work whose key shares the caller's
+        ``{chat_id}:{thread_id}`` prefix.
 
         Returns an empty list when the source is not in a thread, or when no
         sibling runs exist — callers must still gate on authorization.
@@ -19192,25 +19291,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         chat_id = getattr(source, "chat_id", None)
         if not thread_id or not chat_id:
             return []
-        platform = source.platform.value
-        chat_type = getattr(source, "chat_type", None) or ""
-        # Prefix that every per-user key in this thread shares, up to and
-        # including the thread_id segment.  Matching either the exact
-        # shared-thread key or any key with a further (user_id) segment
-        # (prefix + ":") avoids cross-matching an unrelated thread whose id
-        # merely starts with this one.
-        prefix = ":".join(
-            ["agent:main", platform, chat_type, str(chat_id), str(thread_id)]
-        )
-        matches = []
+        # Reuse the canonical builder instead of parsing the key layout here.
+        # Clearing only participant identity yields the exact shared prefix,
+        # including multiplex profile and Slack workspace scope.
+        prefix_source = dataclasses.replace(source, user_id=None, user_id_alt=None)
+        prefix = self._session_key_for_source(prefix_source)
+        candidates = set()
         for key, agent in self._running_agent_items():
             if key == own_key:
                 continue
             if agent is _AGENT_PENDING_SENTINEL or not agent:
                 continue
-            if key == prefix or key.startswith(prefix + ":"):
-                matches.append(key)
-        return matches
+            candidates.add(key)
+        lock = getattr(self, "_auxiliary_work_lock", None)
+        registry = getattr(self, "_auxiliary_work", None)
+        if lock is not None and registry is not None:
+            with lock:
+                candidates.update(
+                    key
+                    for key, owned in registry.items()
+                    if any(not getattr(handle, "done", False) for handle in owned.values())
+                )
+        return sorted(
+            key
+            for key in candidates
+            if key != own_key and (key == prefix or key.startswith(prefix + ":"))
+        )
 
 
 
@@ -23929,6 +24035,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Interrupt the current run and clear queued session state consistently."""
         if not session_key:
             return
+        self._cancel_auxiliary_work(session_key, interrupt_reason)
         _iac_state = self._peek_session_state(session_key)
         running_agent = _iac_state.turn.agent if _iac_state else None
         _process_task_id = ""
