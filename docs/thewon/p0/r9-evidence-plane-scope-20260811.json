@@ -1,0 +1,39 @@
+{
+  "schema": "thewon-p0-r9-evidence-plane-scope-v1",
+  "authority_base_commit": "af37881b93a393cfe0ee24666709af0fcbda6109",
+  "candidate_branch": "candidate/thewon-p0-r9-20260811",
+  "scope_sha256": "a0f1d4f5b400ac6397fd83a49439b90460ad7b1426ed3b7073a8972ff1abacbb",
+  "allowed_paths": [
+    "docs/thewon/p0/r9-evidence-plane-scope-20260811.json",
+    "hermes_cli/thewon_p0_evidence.py",
+    "tests/hermes_cli/test_thewon_p0_evidence.py"
+  ],
+  "mutation_boundary": {
+    "canonical_source": "unchanged",
+    "runtime": "unchanged",
+    "slack": "unchanged",
+    "vault": "unchanged",
+    "canvas": "unchanged",
+    "container": "unchanged",
+    "service": "unchanged",
+    "secret": "unchanged",
+    "restart": "unchanged"
+  },
+  "workflow": {
+    "stage": "candidate",
+    "gatekeeper": "not_requested",
+    "live_mutation": "not_requested",
+    "mina_finalization": "not_requested"
+  },
+  "trusted_inputs": {
+    "config": "/etc/hermes/thewon-p0-verifier-config.json",
+    "required": [
+      "expected P0 contract",
+      "sealed receipt DB SHA-256",
+      "sealed agent projection SHA-256",
+      "sealed central projection SHA-256"
+    ],
+    "candidate_storage_paths": "prohibited"
+  },
+  "rollback": "delete candidate/thewon-p0-r9-20260811 and remove its isolated worktree; no canonical or runtime rollback is required"
+}
