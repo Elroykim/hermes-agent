@@ -4,9 +4,10 @@ The bridge sits below the agent loop at SessionDB persistence so gateway, CLI,
 cron, and future frontends share one append-only audit path. It is config-gated
 and fail-open: Blackbox failures must never block Hermes session persistence.
 
-SessionDB commits before this best-effort mirror runs. Without a durable outbox,
-a process crash in that interval can lose the Blackbox copy. That delivery gap
-is intentionally reported as OPEN and must not be described as closed.
+SessionDB commits each message and its durable Blackbox outbox row atomically,
+then attempts delivery after commit. Receiver failures leave the outbox row
+pending for a later bounded drain; recorder readiness and successful delivery
+remain separate runtime facts.
 """
 
 from __future__ import annotations
@@ -32,7 +33,7 @@ _lock = threading.Lock()
 _recorder: Any = None
 _recorder_key: tuple[str, str] | None = None
 
-MIRROR_DELIVERY_GATE = "OPEN_NO_DURABLE_OUTBOX"
+MIRROR_DELIVERY_GATE = "DURABLE_OUTBOX_INSTALLED"
 
 
 @dataclass(frozen=True)

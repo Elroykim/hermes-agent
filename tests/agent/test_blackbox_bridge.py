@@ -339,8 +339,9 @@ def test_transcript_recorder_exception_returns_failed_result(monkeypatch):
     assert "private recorder detail" not in repr(result)
 
 
-def test_crash_gap_is_explicitly_open_without_durable_outbox():
-    assert bridge.MIRROR_DELIVERY_GATE == "OPEN_NO_DURABLE_OUTBOX"
+def test_delivery_gate_reports_installed_durable_outbox():
+    assert bridge.MIRROR_DELIVERY_GATE == "DURABLE_OUTBOX_INSTALLED"
+    assert bridge.status()["delivery_gate"] == "DURABLE_OUTBOX_INSTALLED"
 
 
 def test_sessiondb_hooks_append_rewrite_and_compaction(monkeypatch, tmp_path):

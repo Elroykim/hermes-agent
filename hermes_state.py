@@ -8054,13 +8054,29 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return inserted_total
 
         def _do(conn):
-            inserted_ids: List[int] = []
             self._check_transcript_write_guards(
                 conn, session_id, compression_lock_holder
             )
+            row = conn.execute(
+                "SELECT COALESCE(MAX(id), 0) FROM messages"
+            ).fetchone()
+            prior_message_id = int(row[0])
             inserted, tool_calls_total = self._insert_message_rows(
-                conn, session_id, messages, inserted_ids=inserted_ids
+                conn, session_id, messages
             )
+            inserted_ids = [
+                int(row[0])
+                for row in conn.execute(
+                    "SELECT id FROM messages WHERE session_id = ? AND id > ? "
+                    "ORDER BY id",
+                    (session_id, prior_message_id),
+                ).fetchall()
+            ]
+            if len(inserted_ids) != inserted:
+                raise RuntimeError(
+                    "inserted message row identity mismatch: "
+                    f"expected={inserted} actual={len(inserted_ids)}"
+                )
             for message_id in inserted_ids:
                 self._enqueue_blackbox_message_outbox(conn, message_id)
             # One aggregated counter update for the whole batch.
@@ -8075,10 +8091,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     "UPDATE sessions SET message_count = message_count + ? WHERE id = ?",
                     (inserted, session_id),
                 )
-            return inserted, inserted_ids
+            return inserted
 
         # Same criticality as append_message: this IS the turn's transcript.
-        inserted, inserted_ids = self._execute_write(
+        inserted = self._execute_write(
             _do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S
         )
         self._drain_blackbox_message_outbox_after_commit()
@@ -8327,12 +8343,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         return row[0] if row else None
 
     def _insert_message_rows(
-        self,
-        conn,
-        session_id: str,
-        messages: List[Dict[str, Any]],
-        *,
-        inserted_ids: Optional[List[int]] = None,
+        self, conn, session_id: str, messages: List[Dict[str, Any]]
     ) -> tuple[int, int]:
         """Insert *messages* as fresh active rows for *session_id*.
 
@@ -8386,7 +8397,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
             api_content = msg.get("api_content")
 
-            cursor = conn.execute(
+            conn.execute(
                 """INSERT INTO messages (session_id, role, content, tool_call_id,
                    tool_calls, tool_name, effect_disposition, timestamp, token_count, finish_reason,
                    reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
@@ -8416,8 +8427,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     self._encode_display_metadata(msg.get("display_metadata")),
                 ),
             )
-            if inserted_ids is not None:
-                inserted_ids.append(int(cursor.lastrowid))
             inserted += 1
             if tool_calls is not None:
                 tool_calls_total += (
