@@ -11,6 +11,7 @@ from hermes_cli.thewon_p0_evidence import (
     LeaseConflict,
     RoundtripContract,
     canonical_sha256,
+    validate_candidate_provenance,
     verify_roundtrip,
 )
 
@@ -149,6 +150,98 @@ def _transition(
         validation=validation or {"passed": True, "command": "pytest tests/hermes_cli/test_thewon_p0_evidence.py"},
         now=now,
     )
+
+
+def _candidate_provenance(*, resources: tuple[str, ...] = ("docs/ledger.json", "docs/manifest.json")):
+    lease_id = "lease-r4"
+    issue_id = "P0-R4"
+    history = [
+        {
+            "event": event,
+            "lease_id": lease_id,
+            "issue_id": issue_id,
+            "resources": list(resources),
+            "owner_bac": "CK",
+            "base_sha": _BASE_SHA,
+            "issued_at": "2026-08-11T00:00:00Z",
+            "expires_at": "2026-08-11T00:10:00Z",
+            "recorded_at": "2026-08-11T00:00:00Z",
+        }
+        for event in ("acquired", "released")
+    ]
+    manifest = {
+        "issue_id": issue_id,
+        "candidate_lease": {"lease_id": lease_id, "owner_bac": "CK", "base_sha": _BASE_SHA},
+        "changed_paths": list(resources),
+    }
+    ledger = {
+        "issues": {
+            issue_id: {
+                "owner_bac": "CK",
+                "base_sha": _BASE_SHA,
+                "mutation_boundary": list(resources),
+            }
+        },
+        "lease_history": history,
+        "resource_leases": {},
+    }
+    return manifest, ledger
+
+
+def test_candidate_provenance_requires_every_changed_file_to_be_declared_and_leased():
+    manifest, ledger = _candidate_provenance()
+
+    assert validate_candidate_provenance(
+        manifest,
+        ledger,
+        issue_id="P0-R4",
+        changed_paths=("docs/ledger.json", "docs/manifest.json"),
+    ) == ("docs/ledger.json", "docs/manifest.json")
+
+    with pytest.raises(EvidenceContractError):
+        validate_candidate_provenance(
+            manifest,
+            ledger,
+            issue_id="P0-R4",
+            changed_paths=("docs/ledger.json", "docs/manifest.json", "docs/changed.py"),
+        )
+
+
+def test_candidate_provenance_rejects_acquire_or_release_history_that_omits_a_changed_file():
+    manifest, ledger = _candidate_provenance()
+    ledger["lease_history"][1]["resources"] = ["docs/manifest.json"]
+
+    with pytest.raises(EvidenceContractError):
+        validate_candidate_provenance(
+            manifest,
+            ledger,
+            issue_id="P0-R4",
+            changed_paths=("docs/ledger.json", "docs/manifest.json"),
+        )
+
+
+def test_candidate_provenance_rejects_base_or_history_order_drift():
+    manifest, ledger = _candidate_provenance()
+    manifest["candidate_lease"]["base_sha"] = "b" * 40
+
+    with pytest.raises(EvidenceContractError):
+        validate_candidate_provenance(
+            manifest,
+            ledger,
+            issue_id="P0-R4",
+            changed_paths=("docs/ledger.json", "docs/manifest.json"),
+        )
+
+    manifest, ledger = _candidate_provenance()
+    ledger["lease_history"] = list(reversed(ledger["lease_history"]))
+
+    with pytest.raises(EvidenceContractError):
+        validate_candidate_provenance(
+            manifest,
+            ledger,
+            issue_id="P0-R4",
+            changed_paths=("docs/ledger.json", "docs/manifest.json"),
+        )
 
 
 def test_roundtrip_requires_thread_bound_nonempty_terminal_and_shared_durable_artifacts():

@@ -1,0 +1,61 @@
+{
+  "schema_version": "thewon-p0-candidate-manifest/v4",
+  "artifact_kind": "thewon-p0-r5-lease-complete-candidate",
+  "status": "CANDIDATE_BOUND_AWAITING_INDEPENDENT_AUDIT",
+  "issue_id": "P0-FOUNDATION-20260811-R5",
+  "authority": {
+    "repository": "Elroykim/hermes-agent",
+    "remote_ref": "fork/main",
+    "runtime_policy_base_sha": "053e585ae3e79ce00104cf688c7eba48a77cc8bf",
+    "release_authority_status": "AWAITING_INDEPENDENT_AUDIT_STANDING_GV_AND_REMOTE_PUBLICATION"
+  },
+  "candidate_lineage": {
+    "branch": "feat/thewon-p0-evidence-plane-r5-20260811",
+    "rework_base_sha": "707870f99c37d770e8f7f4712e5677931770086d",
+    "supersedes_candidate": "thewon-p0-r3-rework-candidate",
+    "supersession_reason": "R3 ledger mutation was absent from its mutation boundary and terminal lease resource lists; R4 local worktree was discarded before commit after concurrent manifest mutation"
+  },
+  "candidate_lease": {
+    "lease_id": "lease-bbb4740da9704a5bb95cac3e4df79308",
+    "owner_bac": "CK",
+    "base_sha": "707870f99c37d770e8f7f4712e5677931770086d",
+    "issued_at": "2026-08-11T13:54:55.353100Z",
+    "expires_at": "2026-08-11T14:54:55.353100Z",
+    "history_required": true
+  },
+  "changed_paths": [
+    "docs/thewon/p0/candidate-manifest-r5-20260811T1400Z.json",
+    "docs/thewon/p0/evidence-ledger.json",
+    "docs/thewon/p0/snapshots/r5-prestate-20260811T1400Z.json",
+    "hermes_cli/thewon_p0_evidence.py",
+    "scripts/thewon_p0_verify_candidate_provenance.py",
+    "tests/hermes_cli/test_thewon_p0_evidence.py"
+  ],
+  "pre_state": {
+    "snapshot_path": "docs/thewon/p0/snapshots/r5-prestate-20260811T1400Z.json",
+    "snapshot_file_sha256": "221bbd0815912881957e6057d655b3980149662e9b12c73cbcd7dd85f0695cd3",
+    "snapshot_sha256": "6b1b9440ca6b18e2d9272da50c87394f1c7a1fa3e338595d57d1a2c564255c3d",
+    "repository_head": "707870f99c37d770e8f7f4712e5677931770086d",
+    "repository_status": "clean_detached_base"
+  },
+  "artifacts": [
+    {"path": "docs/thewon/p0/snapshots/r5-prestate-20260811T1400Z.json", "sha256": "221bbd0815912881957e6057d655b3980149662e9b12c73cbcd7dd85f0695cd3"},
+    {"path": "hermes_cli/thewon_p0_evidence.py", "sha256": "c701b417cd29fb86e35ae40f37ab3b035324ea38b87e28294282e9d9c925951b"},
+    {"path": "scripts/thewon_p0_verify_candidate_provenance.py", "sha256": "6a17be96bdd670f0957c0d10db98224e9b8bc2fbecba734513bdfb6f44c9e4d5"},
+    {"path": "tests/hermes_cli/test_thewon_p0_evidence.py", "sha256": "6d06f4904a6193d5092ce7e1c467c565e5d95502b945160e20adba4eb3e16552"}
+  ],
+  "validation": {
+    "unit_command": "scripts/run_tests.sh tests/hermes_cli/test_thewon_p0_evidence.py tests/hermes_cli/test_thewon_p0_review.py tests/hermes_cli/test_teacher_receipt_recovery.py -q",
+    "provenance_command": "python scripts/thewon_p0_verify_candidate_provenance.py --base-sha 707870f99c37d770e8f7f4712e5677931770086d --issue-id P0-FOUNDATION-20260811-R5 --manifest docs/thewon/p0/candidate-manifest-r5-20260811T1400Z.json --ledger docs/thewon/p0/evidence-ledger.json",
+    "result": "PENDING_POSTCOMMIT_EXECUTION",
+    "live_status": "QUARANTINED_NO_DEPLOY"
+  },
+  "rollback": "git reset --hard 707870f99c37d770e8f7f4712e5677931770086d in the R5 isolated worktree",
+  "stop_conditions": [
+    "actual Git diff, manifest scope, mutation boundary, or acquire/release lease history differ",
+    "base SHA, artifact digest, or remote publication differs",
+    "non-standing, stale, duplicate, cross-thread, or cross-channel reviewer receipt",
+    "any live mutation before Gatekeeper approval"
+  ],
+  "next_gate": "independent_audit_then_standing_GV_then_MINA_final_decision"
+}

@@ -105,6 +105,85 @@ def canonical_sha256(value: object) -> str:
     return hashlib.sha256(_canonical_json(value)).hexdigest()
 
 
+def _candidate_paths(values: object, name: str) -> tuple[str, ...]:
+    if not isinstance(values, (list, tuple)):
+        raise EvidenceContractError(f"{name} must be a path list")
+    paths = tuple(sorted({_require_text(value, name) for value in values}))
+    if not paths or len(paths) != len(values):
+        raise EvidenceContractError(f"{name} must be a non-empty unique path list")
+    if any(path.startswith("/") or path.startswith("../") or "/../" in path for path in paths):
+        raise EvidenceContractError(f"{name} contains a non-repository path")
+    return paths
+
+
+def validate_candidate_provenance(
+    manifest: Mapping[str, object],
+    ledger: Mapping[str, object],
+    *,
+    issue_id: str,
+    changed_paths: Iterable[str],
+) -> tuple[str, ...]:
+    """Bind a committed candidate's exact diff to its issue and terminal lease.
+
+    The candidate manifest is intentionally not its own hash authority.  Instead,
+    this function compares an externally derived Git diff with all three mutable
+    declarations: the manifest scope, the issue mutation boundary, and the
+    acquire/release rows of one terminal lease.
+    """
+
+    expected_issue = _require_text(issue_id, "issue_id")
+    if not isinstance(manifest, Mapping) or not isinstance(ledger, Mapping):
+        raise EvidenceContractError("candidate provenance inputs must be mappings")
+    if manifest.get("issue_id") != expected_issue:
+        raise EvidenceContractError("candidate manifest issue does not match")
+    changed = _candidate_paths(tuple(changed_paths), "changed_paths")
+    declared = _candidate_paths(manifest.get("changed_paths"), "manifest changed_paths")
+    if declared != changed:
+        raise EvidenceContractError("candidate manifest does not cover the exact Git diff")
+
+    lease = manifest.get("candidate_lease")
+    issues = ledger.get("issues")
+    history = ledger.get("lease_history")
+    if not isinstance(lease, Mapping) or not isinstance(issues, Mapping) or not isinstance(history, list):
+        raise EvidenceContractError("candidate provenance structure is malformed")
+    lease_id = _require_text(lease.get("lease_id"), "candidate lease_id")
+    owner_bac = _require_text(lease.get("owner_bac"), "candidate owner_bac")
+    base_sha = _require_sha(lease.get("base_sha"), "candidate base_sha", _GIT_SHA_LENGTHS)
+    issue = issues.get(expected_issue)
+    if not isinstance(issue, Mapping):
+        raise EvidenceContractError("candidate issue is missing from the ledger")
+    if issue.get("owner_bac") != owner_bac:
+        raise EvidenceContractError("candidate lease owner does not match the issue owner")
+    if _require_sha(issue.get("base_sha"), "issue base_sha", _GIT_SHA_LENGTHS) != base_sha:
+        raise EvidenceContractError("candidate lease base SHA does not match the issue")
+    boundary = _candidate_paths(issue.get("mutation_boundary"), "issue mutation_boundary")
+    if boundary != changed:
+        raise EvidenceContractError("issue mutation boundary does not cover the exact Git diff")
+
+    rows = [
+        row
+        for row in history
+        if isinstance(row, Mapping) and row.get("issue_id") == expected_issue and row.get("lease_id") == lease_id
+    ]
+    if len(rows) != 2 or [row.get("event") for row in rows] != ["acquired", "released"]:
+        raise EvidenceContractError("candidate lease must have one acquired and one released history row")
+    for row in rows:
+        if row.get("owner_bac") != owner_bac:
+            raise EvidenceContractError("candidate lease history owner drifted")
+        if _require_sha(row.get("base_sha"), "candidate lease history base_sha", _GIT_SHA_LENGTHS) != base_sha:
+            raise EvidenceContractError("candidate lease history base SHA drifted")
+        if _candidate_paths(row.get("resources"), "candidate lease resources") != changed:
+            raise EvidenceContractError("candidate lease history does not cover the exact Git diff")
+    resource_leases = ledger.get("resource_leases")
+    if not isinstance(resource_leases, Mapping) or any(
+        path in resource_leases
+        or isinstance(row, Mapping) and row.get("lease_id") == lease_id
+        for path, row in resource_leases.items()
+    ):
+        raise EvidenceContractError("candidate lease is not terminally released")
+    return changed
+
+
 def _require_text(value: object, name: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise EvidenceContractError(f"{name} must be a non-empty string")
