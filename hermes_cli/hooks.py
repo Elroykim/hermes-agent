@@ -40,8 +40,61 @@ def hooks_command(args) -> None:
         _cmd_revoke(args)
     elif sub == "doctor":
         _cmd_doctor(args)
+    elif sub == "teacher-receipt":
+        _cmd_teacher_receipt(args)
     else:
         print(f"Unknown hooks subcommand: {sub}")
+
+
+def _cmd_teacher_receipt(args) -> None:
+    """Publish a repository-managed, task/run-bound teacher receipt."""
+    from dataclasses import asdict
+
+    from hermes_cli.teacher_receipt_recovery import (
+        NativeKanbanAttachmentPublisher,
+        ReceiptRecoveryError,
+        ReceiptStore,
+        RecoveryCoordinator,
+    )
+
+    try:
+        event = json.loads(Path(args.event_file).read_text(encoding="utf-8"))
+        result = json.loads(Path(args.result_file).read_text(encoding="utf-8"))
+        if not isinstance(event, dict) or not isinstance(result, dict):
+            raise ReceiptRecoveryError(
+                "malformed_receipt_payload",
+                "event and result files must contain JSON objects",
+                retryable=False,
+            )
+        completion_key = event.get("completion_key")
+        if not isinstance(completion_key, str):
+            raise ReceiptRecoveryError(
+                "malformed_receipt_payload",
+                "event completion_key is required",
+                retryable=False,
+            )
+        store = ReceiptStore(Path(args.receipt_dir))
+        publisher = NativeKanbanAttachmentPublisher(board=args.board)
+        coordinator = RecoveryCoordinator(Path(args.state_dir), max_attempts=args.max_attempts)
+        outcome = coordinator.attempt(
+            completion_key,
+            lambda: asdict(store.publish(event, result, attachment_publisher=publisher)),
+        )
+    except (OSError, json.JSONDecodeError, ReceiptRecoveryError, ValueError) as exc:
+        print(
+            json.dumps(
+                {
+                    "status": "terminal",
+                    "reason": "teacher_receipt_input_error",
+                    "detail": str(exc),
+                },
+                sort_keys=True,
+            )
+        )
+        raise SystemExit(2) from exc
+    print(json.dumps(asdict(outcome), ensure_ascii=True, sort_keys=True))
+    if outcome.status != "completed":
+        raise SystemExit(2)
 
 
 # ---------------------------------------------------------------------------

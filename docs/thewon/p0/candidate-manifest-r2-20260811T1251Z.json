@@ -1,0 +1,63 @@
+{
+  "schema_version": "thewon-p0-candidate-manifest/v2",
+  "artifact_kind": "thewon-p0-r2-candidate",
+  "status": "CANDIDATE_BOUND_AWAITING_GV",
+  "run_id": "p0-r2-recreate-20260811-1251",
+  "completion_key": "p0-r2-recreate-20260811-1251",
+  "base_sha": "053e585ae3e79ce00104cf688c7eba48a77cc8bf",
+  "branch": "feat/thewon-p0-evidence-plane-r2-20260811",
+  "repository": "Elroykim/hermes-agent",
+  "remote_ref": "fork/main",
+  "bootstrap_lease": {
+    "lease_id": "lease-282df4d1-bb38-486a-bcc9-6d210c719331",
+    "owner_bac": "CK",
+    "vault_commit": "283c5b0a0cb04414b535a313b933ffd236f893a3",
+    "vault_receipt_path": "00.System/Governance/P0_R2_Bootstrap_Lease_20260811.md",
+    "vault_receipt_sha256": "90d908bdc76b23911ebeaf79dba861daae930674864d691053af10f59d8edacc"
+  },
+  "pre_state": {
+    "snapshot_path": "docs/thewon/p0/snapshots/recreated-pre-gate-20260811T2126Z.json",
+    "snapshot_file_sha256": "f9fc6f00d1702a473d37ab4a9fde52337133d809de6bf336728d1a5ac77d8787",
+    "snapshot_sha256": "62dc779591838dd1322dc8910c0d1a80961512e812bbbd5234e5d3580f3421ba"
+  },
+  "source_anchor": {
+    "path": "/Users/elroy/.hermes/memories/MEMORY.md",
+    "sha256": "e52ab9c83ba88bfaf61fe9b705fd51b299a6b44b3101408354f2cb3677ebdca4",
+    "kind": "runtime policy anchor; GV must confirm release authority"
+  },
+  "supersedes": {
+    "r1_candidate": "feat/thewon-p0-evidence-plane-fork-20260811",
+    "reason": "R1 dependency repair occurred after its candidate-local lease was released",
+    "rework_receipt_sha256": "3003efefb66faeda6a14ad96653334d6c5f1ead35e66596ff82a9b54b6886726"
+  },
+  "artifacts": [
+    {"path": ".gitignore", "sha256": "360c001068cf4c95b7b98e404def6cbdf2999decc1000551c3ed7ef95e25c2a8"},
+    {"path": "docs/thewon/p0/README.md", "sha256": "13d462378faad49db95c9da9e28e7a0ef88dfa25bdacd84ad64a2ef2cde4d5f1"},
+    {"path": "docs/thewon/p0/history/legacy-evidence-ledger-b27.json", "sha256": "88e7638f0fa699454112d2baee6944815ac656e52e64541c9a6bb453cab738ba"},
+    {"path": "docs/thewon/p0/rework/fork-hook-dependency-gap-20260811T2135Z.json", "sha256": "3003efefb66faeda6a14ad96653334d6c5f1ead35e66596ff82a9b54b6886726"},
+    {"path": "hermes_cli/hooks.py", "sha256": "a96dc895ff95b67909cfbbed61a0adc1308808a94330d3c239a476f0474a09fa"},
+    {"path": "hermes_cli/subcommands/hooks.py", "sha256": "4fa9849314b5699fecae1577ca8c1e7b29f9a70ed7db5572accb8eaad1641c14"},
+    {"path": "hermes_cli/thewon_p0_evidence.py", "sha256": "80ba9fbc5c83205e70ddeb7a3a6b3ae303df182814a8ff5f38419cb7b9ac570f"},
+    {"path": "hermes_cli/thewon_p0_review.py", "sha256": "3ca794636f3edccc66221ec85ee26c212fadb43de63cb58b0b2648e9ff06487c"},
+    {"path": "hermes_cli/teacher_receipt_recovery.py", "sha256": "4ed82712a6ca8424e04304f1b579ce1fbcc1c1576fdffd363d276e86003667f3"},
+    {"path": "hermes_cli/kanban_db.py", "sha256": "91017c41c10e70530e2d606a8ee3516214b032c35d402e010402eeb59ef2335a"},
+    {"path": "hermes_cli/plugins.py", "sha256": "2ca2f8d90c1c356c338cb0fc324503324a1d03ee96e2e78c0989dc3419446ec9"},
+    {"path": "hermes_cli/observability/__init__.py", "sha256": "1e897ee9ec87a540f9aa6dd521682ca8792041c2c83abceda9e9249a6c8d02a3"},
+    {"path": "hermes_cli/observability/teacher_receipt_observer.py", "sha256": "1d7b7d0f2209073af12dc7187a16057aa8ffb0207683e153da50b120e033b6cb"},
+    {"path": "scripts/thewon_p0_capture_snapshot.py", "sha256": "1123f464c3a0465d4fb9e39831761711f9b86d5a63526aa44d917b1a5b5d7a31"},
+    {"path": "scripts/thewon_p0_ledger.py", "sha256": "0a8333cf7020ac0c3b48a377f66bf9c366a534983c8afb077f10d3e7318f4f0d"},
+    {"path": "scripts/thewon_p0_verify_roundtrip.py", "sha256": "d6fdb35b19ba816e7281159426e25b2a959c848f2d8fe75dc5c956345f2cc616"},
+    {"path": "tests/hermes_cli/test_thewon_p0_evidence.py", "sha256": "7c58eaa03d6ec4be632e3f14c5df114b16da77f7215cb4bcb831982728a76cef"},
+    {"path": "tests/hermes_cli/test_thewon_p0_review.py", "sha256": "c7b7863355d1a94938fc61828d6657100575b14da0116c20b6be423170ba7637"},
+    {"path": "tests/hermes_cli/test_teacher_receipt_recovery.py", "sha256": "87226da6b891a9a9b6dcde774c5148bc2c28e3ade1b794981459117636790413"}
+  ],
+  "validation": {
+    "command": "scripts/run_tests.sh tests/hermes_cli/test_thewon_p0_evidence.py tests/hermes_cli/test_thewon_p0_review.py tests/hermes_cli/test_teacher_receipt_recovery.py -q",
+    "result": "46 passed",
+    "compileall": "PASS",
+    "diff_check": "PASS",
+    "live_status": "QUARANTINED_NO_DEPLOY"
+  },
+  "rollback": "git reset --hard 053e585ae3e79ce00104cf688c7eba48a77cc8bf in the R2 isolated worktree",
+  "next_gate": "standing_GV_authority_and_candidate_review"
+}

@@ -1,0 +1,29 @@
+{
+  "artifact_kind": "thewon-p0-candidate-rework",
+  "base_sha": "053e585ae3e79ce00104cf688c7eba48a77cc8bf",
+  "candidate_branch": "feat/thewon-p0-evidence-plane-fork-20260811",
+  "candidate_status": "REWORK_REQUIRED",
+  "detected_at": "2026-08-11T12:35:00Z",
+  "failure": {
+    "command": "scripts/run_tests.sh tests/hermes_cli/test_teacher_receipt_recovery.py -q",
+    "result": "21 passed, 8 failed",
+    "missing_dependencies": [
+      "hermes_cli.kanban_db.store_attachment_bytes",
+      "hermes_cli.observability.teacher_receipt_observer"
+    ],
+    "impact": "The candidate teacher-receipt hook cannot prove its lifecycle and durable attachment boundary on the fork base."
+  },
+  "mutation_boundary": [
+    "hermes_cli/kanban_db.py",
+    "hermes_cli/observability/",
+    "hermes_cli/teacher_receipt_recovery.py",
+    "tests/hermes_cli/test_teacher_receipt_recovery.py",
+    "docs/thewon/p0"
+  ],
+  "next_gate": "forward-port only the missing dependency surface, then rerun the exact P0 focused suite before GV review.",
+  "live_status": "QUARANTINED_NO_DEPLOY",
+  "supersedes": {
+    "candidate_manifest": "docs/thewon/p0/candidate-manifest.json",
+    "reason": "Its focused-test count predates the teacher-receipt lifecycle dependency check."
+  }
+}

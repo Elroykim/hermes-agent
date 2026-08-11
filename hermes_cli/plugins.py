@@ -2049,6 +2049,16 @@ def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
 
     Returns a list of non-``None`` return values from plugin callbacks.
     """
+    try:
+        from hermes_cli.observability.teacher_receipt_observer import (
+            observe_lifecycle,
+        )
+
+        observe_lifecycle(hook_name, **kwargs)
+    except Exception:
+        _log.warning(
+            "Built-in lifecycle observer failed: %s", hook_name, exc_info=True
+        )
     return get_plugin_manager().invoke_hook(hook_name, **kwargs)
 
 

@@ -74,4 +74,27 @@ def build_hooks_parser(subparsers, *, cmd_hooks: Callable) -> None:
         ),
     )
 
+    _teacher_receipt = hooks_subparsers.add_parser(
+        "teacher-receipt",
+        help=(
+            "Publish one task/run-bound teacher receipt through the native Kanban store"
+        ),
+    )
+    _teacher_receipt.add_argument(
+        "--event-file", required=True, help="Canonical completion-event JSON"
+    )
+    _teacher_receipt.add_argument(
+        "--result-file", required=True, help="Canonical review-result JSON"
+    )
+    _teacher_receipt.add_argument(
+        "--receipt-dir", required=True, help="Durable receipt directory"
+    )
+    _teacher_receipt.add_argument(
+        "--state-dir", required=True, help="Bounded recovery-state directory"
+    )
+    _teacher_receipt.add_argument(
+        "--board", default=None, help="Optional native Kanban board"
+    )
+    _teacher_receipt.add_argument("--max-attempts", type=int, default=3)
+
     hooks_parser.set_defaults(func=cmd_hooks)

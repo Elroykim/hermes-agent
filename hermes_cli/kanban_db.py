@@ -135,6 +135,7 @@ BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
 _IS_WINDOWS = sys.platform == "win32"
+KANBAN_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024
 
 
 def _fire_kanban_lifecycle_hook(event: str, task_id: str, **fields: Any) -> None:
@@ -2961,6 +2962,74 @@ def list_comments(conn: sqlite3.Connection, task_id: str) -> list[Comment]:
 # ---------------------------------------------------------------------------
 # Attachments
 # ---------------------------------------------------------------------------
+
+class AttachmentTooLarge(ValueError):
+    """Raised when an attachment exceeds the configured size cap."""
+
+
+def _safe_attachment_name(raw: str) -> str:
+    """Reduce a client-supplied filename to a safe basename."""
+    name = (raw or "").replace("\\", "/").split("/")[-1].strip()
+    name = "".join(
+        character for character in name if character.isprintable() and character != "\\x00"
+    ).strip()
+    name = name.lstrip(".").strip()
+    if not name:
+        raise ValueError("invalid attachment filename")
+    return name[:200]
+
+
+def _collision_free_path(dest_dir: Path, safe_name: str) -> Path:
+    """Return a safe path below the destination directory."""
+    stem, dot, ext = safe_name.partition(".")
+    candidate = safe_name
+    sequence = 1
+    while (dest_dir / candidate).exists():
+        candidate = f"{stem} ({sequence}){dot}{ext}"
+        sequence += 1
+    return dest_dir / candidate
+
+
+def store_attachment_bytes(
+    conn: sqlite3.Connection,
+    task_id: str,
+    filename: str,
+    data: bytes,
+    *,
+    content_type: Optional[str] = None,
+    uploaded_by: Optional[str] = None,
+    board: Optional[str] = None,
+    max_bytes: Optional[int] = None,
+) -> int:
+    """Persist a bounded attachment and its native Kanban metadata."""
+    if max_bytes is None:
+        max_bytes = KANBAN_ATTACHMENT_MAX_BYTES
+    if len(data) > max_bytes:
+        raise AttachmentTooLarge(
+            f"attachment exceeds {max_bytes // (1024 * 1024)} MB limit"
+        )
+    safe_name = _safe_attachment_name(filename)
+    destination_dir = task_attachments_dir(task_id, board=board)
+    destination_dir.mkdir(parents=True, exist_ok=True)
+    destination = _collision_free_path(destination_dir, safe_name)
+    destination.write_bytes(data)
+    try:
+        return add_attachment(
+            conn,
+            task_id,
+            filename=destination.name,
+            stored_path=str(destination.resolve()),
+            content_type=content_type,
+            size=len(data),
+            uploaded_by=uploaded_by,
+        )
+    except Exception:
+        try:
+            destination.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
 
 def add_attachment(
     conn: sqlite3.Connection,
