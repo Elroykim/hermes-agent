@@ -1,0 +1,12 @@
+{
+  "schema_version": "thewon-p0-r6-prestate/v1",
+  "captured_at": "2026-08-11T00:00:00Z",
+  "base_authority_commit": "af37881b93a393cfe0ee24666709af0fcbda6109",
+  "base_authority_tree": "4b9cbdf2c96d29afb8241ba61efb56a669acc3d2",
+  "rebuild_base_commit": "053e585ae3e79ce00104cf688c7eba48a77cc8bf",
+  "rebuild_base_tree": "6950f060c82073640e7f7a28f3ff2845737f258c",
+  "r2_r3_r4_r5": "EXCLUDED_FROM_AUTHORITY",
+  "runtime_action": "NONE",
+  "slack_action": "NONE",
+  "vault_action": "NONE"
+}
