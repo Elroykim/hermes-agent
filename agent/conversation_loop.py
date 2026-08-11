@@ -104,7 +104,8 @@ logger = logging.getLogger(__name__)
 _INTERRUPT_SCAFFOLD_MARKER = "[This response was interrupted by a user correction.]"
 
 _EXACT_LINE_CONTRACT_RE = re.compile(
-    r"^\[HERMES_EXACT_TERMINAL_V1\] ([^\r\n]+)[ \t]*\Z",
+    r"^(?:\[[^\r\n]{0,320}\| Slack user <@[A-Z0-9]{3,32}>\] )?"
+    r"\[HERMES_EXACT_TERMINAL_V1\] ([^\r\n]+)[ \t]*\Z",
     re.MULTILINE,
 )
 _MAX_EXACT_LINE_CONTRACT_CHARS = 4096

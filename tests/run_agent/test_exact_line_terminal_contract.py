@@ -130,6 +130,82 @@ def test_exact_line_contract_sends_only_contract_bound_history(
     assert "HISTORICAL_SENTINEL" in repr(result["messages"])
 
 
+def test_gateway_wrapped_slack_contract_sends_only_two_bound_messages(
+    tmp_path, monkeypatch
+):
+    """Exercise the shape produced by GatewayRunner before run_conversation."""
+    agent = _agent(tmp_path, monkeypatch)
+    expected = "MINA_VISIBLE_TERMINAL_OK"
+    captured = {}
+
+    def _call(api_kwargs):
+        captured.update(api_kwargs)
+        return _response(expected)
+
+    monkeypatch.setattr(agent, "_interruptible_api_call", _call)
+    gateway_message = (
+        '[Replying to: "P0 parent"]\n\n'
+        "[Thread context — prior messages in this thread "
+        "(not yet in conversation history):]\n"
+        "[assistant] [HERMES_EXACT_TERMINAL_V1] STALE_QUOTED_VALUE\n"
+        "[End of thread context]\n\n"
+        "[New message]\n"
+        "[Elroy | Slack user <@U0APE8BDM0W>] "
+        f"[HERMES_EXACT_TERMINAL_V1] {expected}"
+    )
+
+    result = agent.run_conversation(
+        gateway_message,
+        conversation_history=[
+            {"role": "user", "content": "GATEWAY_HISTORY_SENTINEL " * 4000},
+            {"role": "assistant", "content": "old answer"},
+        ],
+    )
+
+    assert result["final_response"] == expected
+    assert [message["role"] for message in captured["messages"]] == [
+        "system",
+        "user",
+    ]
+    assert captured["messages"][-1]["content"].endswith(expected)
+    assert "GATEWAY_HISTORY_SENTINEL" not in repr(captured)
+    assert "STALE_QUOTED_VALUE" not in repr(captured)
+    assert "tools" not in captured
+    assert "tool_choice" not in captured
+
+
+def test_gateway_wrapped_stale_contract_is_not_reactivated(
+    tmp_path, monkeypatch
+):
+    agent = _agent(tmp_path, monkeypatch)
+    captured = {}
+
+    def _call(api_kwargs):
+        captured.update(api_kwargs)
+        return _response("ordinary response")
+
+    monkeypatch.setattr(agent, "_interruptible_api_call", _call)
+    gateway_message = (
+        "[Thread context — prior messages in this thread "
+        "(not yet in conversation history):]\n"
+        "[user] [HERMES_EXACT_TERMINAL_V1] STALE_QUOTED_VALUE\n"
+        "[End of thread context]\n\n"
+        "[New message]\n"
+        "[Elroy | Slack user <@U0APE8BDM0W>] ordinary follow-up"
+    )
+
+    result = agent.run_conversation(
+        gateway_message,
+        conversation_history=[
+            {"role": "user", "content": "ORDINARY_HISTORY_SENTINEL"},
+            {"role": "assistant", "content": "old answer"},
+        ],
+    )
+
+    assert result["final_response"] == "ordinary response"
+    assert "ORDINARY_HISTORY_SENTINEL" in repr(captured["messages"])
+
+
 def test_exact_line_contract_execution_middleware_cannot_reinflate_request(
     tmp_path, monkeypatch
 ):
