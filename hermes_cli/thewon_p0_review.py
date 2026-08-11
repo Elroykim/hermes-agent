@@ -33,6 +33,8 @@ class ReviewBinding:
 @dataclass(frozen=True)
 class GVVerdict:
     message_ts: str
+    channel_id: str
+    thread_ts: str
     user_id: str
     verdict: str
     artifact_sha256: str
@@ -71,27 +73,49 @@ def _sha(value: object, name: str) -> str:
     return value
 
 
-def select_gv_verdict(binding: ReviewBinding, messages: Sequence[Mapping[str, object]]) -> GVVerdict:
-    """Select exactly one fully bound GV verdict from a complete thread page."""
-
+def _validated_binding(binding: ReviewBinding) -> tuple[str, str, Decimal, str]:
+    channel_id = _text(binding.channel_id, "channel_id")
+    thread_ts = _text(binding.thread_ts, "thread_ts")
+    _ts(thread_ts, "thread_ts")
     for value, name in (
-        (binding.channel_id, "channel_id"),
-        (binding.thread_ts, "thread_ts"),
         (binding.run_id, "run_id"),
         (binding.completion_key, "completion_key"),
         (binding.expected_gv_user_id, "expected_gv_user_id"),
     ):
         _text(value, name)
-    expected_artifact_sha256 = _sha(
-        binding.expected_artifact_sha256,
-        "expected_artifact_sha256",
+    return (
+        channel_id,
+        thread_ts,
+        _ts(binding.request_ts, "request_ts"),
+        _sha(binding.expected_artifact_sha256, "expected_artifact_sha256"),
     )
-    request_time = _ts(binding.request_ts, "request_ts")
+
+
+def _bound_message_value(
+    row: Mapping[str, object],
+    name: str,
+    expected: str,
+) -> str:
+    value = _text(row.get(name), f"GV message {name}")
+    if value != expected:
+        raise ReviewBindingError(f"GV message {name} does not match the review binding")
+    return value
+
+
+def select_gv_verdict(binding: ReviewBinding, messages: Sequence[Mapping[str, object]]) -> GVVerdict:
+    """Select exactly one fully bound GV verdict from a complete thread page."""
+
+    channel_id, thread_ts, request_time, expected_artifact_sha256 = _validated_binding(binding)
     candidates: list[GVVerdict] = []
     for row in messages:
-        if row.get("user") != binding.expected_gv_user_id:
+        if not isinstance(row, Mapping):
+            raise ReviewBindingError("GV message must be a mapping")
+        _bound_message_value(row, "channel_id", channel_id)
+        _bound_message_value(row, "thread_ts", thread_ts)
+        if _text(row.get("user"), "GV message user") != binding.expected_gv_user_id:
             continue
-        message_time = _ts(row.get("ts"), "GV message ts")
+        message_ts = _text(row.get("ts"), "GV message ts")
+        message_time = _ts(message_ts, "GV message ts")
         if message_time <= request_time:
             continue
         text = _text(row.get("text"), "GV response text")
@@ -102,13 +126,17 @@ def select_gv_verdict(binding: ReviewBinding, messages: Sequence[Mapping[str, ob
         if match is None:
             continue
         review = match.groupdict()
-        if review["run_id"] != binding.run_id or review["completion_key"] != binding.completion_key:
+        if review["completion_key"] != binding.completion_key:
             continue
+        if review["run_id"] != binding.run_id:
+            raise ReviewBindingError("GV completion key is already bound to a different run")
         if review["artifact_sha256"] != expected_artifact_sha256:
-            continue
+            raise ReviewBindingError("GV artifact does not match the requested artifact")
         candidates.append(
             GVVerdict(
-                message_ts=str(row["ts"]),
+                message_ts=message_ts,
+                channel_id=channel_id,
+                thread_ts=thread_ts,
                 user_id=binding.expected_gv_user_id,
                 verdict=review["verdict"],
                 artifact_sha256=_sha(review["artifact_sha256"], "GV artifact_sha256"),
@@ -123,15 +151,20 @@ def select_gv_verdict(binding: ReviewBinding, messages: Sequence[Mapping[str, ob
 def build_gv_receipt(binding: ReviewBinding, verdict: GVVerdict) -> dict[str, object]:
     """Build a transparent receipt from, rather than in place of, GV evidence."""
 
-    if verdict.user_id != binding.expected_gv_user_id:
+    channel_id, thread_ts, request_time, expected_artifact_sha256 = _validated_binding(binding)
+    if _text(verdict.channel_id, "verdict channel_id") != channel_id:
+        raise ReviewBindingError("receipt channel does not match the review binding")
+    if _text(verdict.thread_ts, "verdict thread_ts") != thread_ts:
+        raise ReviewBindingError("receipt thread does not match the review binding")
+    if _text(verdict.user_id, "verdict user_id") != binding.expected_gv_user_id:
         raise ReviewBindingError("receipt identity does not match the configured GV")
-    if _ts(verdict.message_ts, "GV message ts") <= _ts(binding.request_ts, "request_ts"):
+    if _ts(verdict.message_ts, "GV message ts") <= request_time:
         raise ReviewBindingError("receipt predates the review request")
-    if verdict.artifact_sha256 != _sha(
-        binding.expected_artifact_sha256,
-        "expected_artifact_sha256",
-    ):
+    if _sha(verdict.artifact_sha256, "verdict artifact_sha256") != expected_artifact_sha256:
         raise ReviewBindingError("receipt artifact does not match the requested artifact")
+    if verdict.verdict not in _VERDICTS:
+        raise ReviewBindingError("receipt verdict is not permitted")
+    _sha(verdict.text_sha256, "verdict text_sha256")
     body = {
         "schema_version": "thewon-p0-gv-receipt/v1",
         **asdict(binding),

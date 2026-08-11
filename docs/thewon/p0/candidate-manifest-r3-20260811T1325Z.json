@@ -1,0 +1,68 @@
+{
+  "schema_version": "thewon-p0-candidate-manifest/v3",
+  "artifact_kind": "thewon-p0-r3-rework-candidate",
+  "status": "CANDIDATE_BOUND_AWAITING_STANDING_GV",
+  "issue_id": "P0-FOUNDATION-20260811-R3",
+  "run_id": "p0-r3-rework-20260811-1325",
+  "completion_key": "p0-r3-rework-20260811-1325",
+  "authority": {
+    "repository": "Elroykim/hermes-agent",
+    "remote_ref": "fork/main",
+    "runtime_policy_base_sha": "053e585ae3e79ce00104cf688c7eba48a77cc8bf",
+    "release_authority_status": "AWAITING_STANDING_GV_AND_REMOTE_PUBLICATION"
+  },
+  "candidate_lineage": {
+    "branch": "feat/thewon-p0-evidence-plane-r3-20260811",
+    "parent_candidate_commit": "1f426bdd719dccbca26e0f4338d6703ff87d76b6",
+    "rework_base_sha": "1f426bdd719dccbca26e0f4338d6703ff87d76b6",
+    "supersedes_candidate": "thewon-p0-r2-candidate",
+    "supersession_reason": "R2 independent audit found cross-thread GV receipt acceptance, unrelated failed roundtrip acceptance, incomplete lease provenance, and observer failure loss"
+  },
+  "vault_governance": {
+    "r3_lease_commit": "829d19759",
+    "r3_lease_receipt_path": "00.System/Governance/P0_R2_Rework_R3_Lease_20260811.md",
+    "r3_lease_receipt_sha256": "f989985e5fdc8ed3348021f8c7e46bc2cdf66eaa4e0fded98e7444be6a823303",
+    "r2_audit_commit": "27b4ab180",
+    "r2_audit_receipt_path": "00.System/Governance/P0_R2_Independent_Audit_20260811.md",
+    "r2_audit_receipt_sha256": "e06e66272c9ff527203e32b4c12c06d51c41f4fcc7591c49e6331dc9d62c7670"
+  },
+  "candidate_lease": {
+    "lease_id": "lease-9ef648e1838541548d2fd3753ee42717",
+    "owner_bac": "CK",
+    "issued_at": "2026-08-11T13:21:24.620361Z",
+    "expires_at": "2026-08-11T14:21:24.620361Z",
+    "history_required": true
+  },
+  "pre_state": {
+    "snapshot_path": "docs/thewon/p0/snapshots/r3-prestate-20260811T1310Z.json",
+    "snapshot_file_sha256": "7bfec3b791fd825a8a5ae4a3b051552a40fd2ef589e5bec8d0dce8f2484097da",
+    "snapshot_sha256": "81e2b321377ebee5c84bd02cfd87b43b35fab26c53eba93287a0aa33e3766c83",
+    "repository_head": "1f426bdd719dccbca26e0f4338d6703ff87d76b6",
+    "repository_status": "clean_detached_base"
+  },
+  "artifacts": [
+    {"path": "docs/thewon/p0/snapshots/r3-prestate-20260811T1310Z.json", "sha256": "7bfec3b791fd825a8a5ae4a3b051552a40fd2ef589e5bec8d0dce8f2484097da"},
+    {"path": "hermes_cli/observability/teacher_receipt_observer.py", "sha256": "79032f449b78a92644bfac24d3578efcb3c9db665b1b43be5d618ae6f5d3925a"},
+    {"path": "hermes_cli/thewon_p0_evidence.py", "sha256": "d6ece6bd42aee013f60c9b047939bea8f36e23eb43b1ef8ecb71619f2f8876f9"},
+    {"path": "hermes_cli/thewon_p0_review.py", "sha256": "e3eb67d3ecffede4ad2b502c7d984a73b64777dfda29d6da9a78acd1603cc01e"},
+    {"path": "tests/hermes_cli/test_teacher_receipt_recovery.py", "sha256": "204120196f6bddb00c9a031eb1e92f5c4a46ccfaaa08ce7d22cd2a5bca25e15e"},
+    {"path": "tests/hermes_cli/test_thewon_p0_evidence.py", "sha256": "0f5c55ea47820659b19568975606ac0738bfdd3f67fd619f07107ca6311bd456"},
+    {"path": "tests/hermes_cli/test_thewon_p0_review.py", "sha256": "cc9a82ccf3d093448553ee88f44f3f51887a8669354e8ece9db0be5f6b6641ea"}
+  ],
+  "validation": {
+    "command": "scripts/run_tests.sh tests/hermes_cli/test_thewon_p0_evidence.py tests/hermes_cli/test_thewon_p0_review.py tests/hermes_cli/test_teacher_receipt_recovery.py -q",
+    "result": "67 passed",
+    "compileall": "PASS",
+    "diff_check": "PASS",
+    "live_status": "QUARANTINED_NO_DEPLOY"
+  },
+  "rollback": "git reset --hard 1f426bdd719dccbca26e0f4338d6703ff87d76b6 in the R3 isolated worktree",
+  "stop_conditions": [
+    "authority or remote publication remains unverified",
+    "lease history, base, or artifact digest mismatch",
+    "non-standing, stale, duplicate, cross-thread, or cross-channel GV receipt",
+    "failed tool, workflow, or Blackbox artifact",
+    "any live mutation before Gatekeeper approval"
+  ],
+  "next_gate": "standing_GV_independent_review_then_Codex_teacher_recheck"
+}

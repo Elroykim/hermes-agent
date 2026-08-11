@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -598,6 +599,86 @@ def test_observer_publishes_receipt_on_session_end(
     with kb.connect() as conn:
         attachments = kb.list_attachments(conn, task_id)
     assert len(attachments) == 1
+
+
+def test_observer_records_failed_state_when_recovery_cannot_write(
+    board: tuple[Path, str, int],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from hermes_cli.observability import teacher_receipt_observer as observer
+    from hermes_cli import teacher_receipt_recovery as recovery
+
+    home, task_id, _ = board
+
+    class FailingCoordinator:
+        def __init__(self, *_: object, **__: object) -> None:
+            pass
+
+        def attempt(self, *_: object, **__: object) -> None:
+            raise ReceiptRecoveryError(
+                "recovery_state_write_failed", "state device unavailable", retryable=False
+            )
+
+    monkeypatch.setattr(recovery, "RecoveryCoordinator", FailingCoordinator)
+    with caplog.at_level(logging.ERROR, logger=observer.__name__):
+        observer.observe_lifecycle(
+            "on_session_end", task_id=task_id, turn_id="recovery-failure", completed=True
+        )
+
+    completion_key = f"{task_id}-recovery-failure"
+    state = json.loads(observer._observer_state_path(home, completion_key).read_text())
+    assert state["status"] == "failed"
+    assert state["reason"] == "recovery_state_write_failed"
+    assert state["observer_attempt"] == 1
+    assert state["recovery_attempts"] is None
+    assert all("completed" not in record.message for record in caplog.records)
+    assert any("Teacher-receipt observer failed" in record.message for record in caplog.records)
+
+
+def test_observer_retries_publish_failure_and_persists_retry_exhaustion(
+    board: tuple[Path, str, int],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from hermes_cli.observability import teacher_receipt_observer as observer
+
+    home, task_id, _ = board
+    calls = 0
+    backoff: list[int] = []
+
+    def fail_publish(self: ReceiptStore, *_: object, **__: object) -> None:
+        nonlocal calls
+        calls += 1
+        raise ReceiptRecoveryError("receipt_attach_failed", "attachment unavailable", retryable=True)
+
+    monkeypatch.setattr(ReceiptStore, "publish", fail_publish)
+    monkeypatch.setattr(observer, "_sleep_for_retry", backoff.append)
+    with caplog.at_level(logging.WARNING, logger=observer.__name__):
+        observer.observe_lifecycle(
+            "on_session_end", task_id=task_id, turn_id="publish-failure", completed=True
+        )
+
+    completion_key = f"{task_id}-publish-failure"
+    recovery_state = RecoveryCoordinator(
+        home / "teacher-receipt-recovery", max_attempts=3
+    ).read_state(completion_key)
+    observer_state = json.loads(observer._observer_state_path(home, completion_key).read_text())
+    assert calls == 3
+    assert backoff == [1, 2]
+    assert recovery_state["status"] == "terminal"
+    assert recovery_state["reason"] == "retry_cap_exhausted"
+    assert recovery_state["artifact_count"] == 0
+    assert recovery_state["result"] is None
+    assert observer_state["status"] == "failed"
+    assert observer_state["reason"] == "retry_cap_exhausted"
+    assert observer_state["observer_attempt"] == 3
+    assert observer_state["recovery_attempts"] == 3
+    assert any("deferred" in record.message for record in caplog.records)
+    assert list((home / "teacher-receipts").glob("*.json")) == []
+
+    with kb.connect() as conn:
+        assert kb.list_attachments(conn, task_id) == []
 
 
 def test_observer_verdict_fail_and_interrupted(
