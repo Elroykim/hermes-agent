@@ -251,6 +251,9 @@ _EPHEMERAL_SCAFFOLDING_FLAGS = (
     # drive the bounded retry. Persisting them would replay the internal
     # retry instruction as user-authored context on resume.
     "_dropped_toolcall_nudge",
+    # Exact-terminal mismatch retry pair. Both the rejected assistant prefix
+    # and the synthetic user nudge are private protocol scaffolding.
+    "_exact_line_contract_synthetic",
 )
 
 

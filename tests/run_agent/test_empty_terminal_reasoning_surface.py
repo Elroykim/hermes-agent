@@ -1,16 +1,13 @@
 """Tests for the empty-terminal reasoning surface.
 
 When the empty-response ladder is fully exhausted (prefill continuation,
-empty-content retries, provider fallback) and the model produced structured
-reasoning but no visible text, the DELIVERED final_response is a clearly
-labeled reasoning excerpt instead of a bare "(empty)" — the reasoning often
-contains the actual answer. Idea credit: PR #48795 (@ligl0325).
+empty-content retries, provider fallback), internal reasoning must not be
+promoted into the delivered response.
 
 Invariants pinned here:
 - The persisted assistant message keeps the "(empty)" sentinel and the
   ``_empty_terminal_sentinel`` marker (replay semantics unchanged).
-- Raw reasoning is NEVER promoted earlier in the ladder — a reasoning-only
-  response still goes through prefill continuation first.
+- Raw reasoning is never delivered or persisted.
 - A truly empty exhaustion (no reasoning either) still returns "(empty)".
 """
 
@@ -81,10 +78,10 @@ def _truly_empty_response():
     )
 
 
-def test_exhausted_reasoning_only_delivers_labeled_excerpt(tmp_path, monkeypatch):
-    """After the full ladder is exhausted on reasoning-only responses, the
-    delivered text is the labeled excerpt — not a bare '(empty)' — while the
-    transcript keeps its existing sentinel-scaffolding semantics."""
+def test_exhausted_reasoning_only_delivers_opaque_failure(
+    tmp_path, monkeypatch, caplog
+):
+    """Reasoning-only exhaustion is visible without exposing its contents."""
     agent = _build_agent(tmp_path, monkeypatch)
     monkeypatch.setattr(
         agent, "_interruptible_api_call",
@@ -94,17 +91,20 @@ def test_exhausted_reasoning_only_delivers_labeled_excerpt(tmp_path, monkeypatch
     result = agent.run_conversation("what is the answer?")
 
     final = result["final_response"]
-    assert "(empty)" != final
-    assert "only internal reasoning" in final
-    assert "The answer is 42" in final
+    assert final.startswith("MODEL_EMPTY_TERMINAL ")
+    assert "reasoning_sha256=" in final
+    assert "The answer is 42" not in final
+    assert "The answer is 42" not in caplog.text
 
-    # Persistence semantics unchanged: the delivered excerpt is
-    # delivery-only. The turn finalizer strips the "(empty)" terminal
-    # sentinel from the transcript tail (replay safety, existing design),
-    # and the labeled excerpt must never be persisted as assistant content.
+    # The turn finalizer strips the internal empty sentinel from the transcript
+    # tail; neither the reasoning nor the opaque delivery sentinel is durable
+    # assistant content.
     assert not any(
         m.get("role") == "assistant"
-        and "only internal reasoning" in (m.get("content") or "")
+        and (
+            "The answer is 42" in (m.get("content") or "")
+            or "MODEL_EMPTY_TERMINAL" in (m.get("content") or "")
+        )
         for m in result["messages"]
     )
 

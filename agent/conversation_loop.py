@@ -16,6 +16,7 @@ resolved through :func:`_ra` so those patches keep working.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -101,6 +102,40 @@ logger = logging.getLogger(__name__)
 # Scaffold marker used by _apply_active_turn_redirect and the ghost-row filter
 # in the api_messages loop. Module-level so both sites can never drift.
 _INTERRUPT_SCAFFOLD_MARKER = "[This response was interrupted by a user correction.]"
+
+_EXACT_LINE_CONTRACT_RE = re.compile(
+    r"^\[HERMES_EXACT_TERMINAL_V1\] ([^\r\n]+)[ \t]*\Z",
+    re.MULTILINE,
+)
+_MAX_EXACT_LINE_CONTRACT_CHARS = 4096
+
+
+def _extract_exact_line_contract(user_message: Any) -> Optional[str]:
+    """Return a bounded explicit one-line response contract, if present."""
+    if not isinstance(user_message, str):
+        return None
+    match = _EXACT_LINE_CONTRACT_RE.search(user_message)
+    if match is None:
+        return None
+    expected = match.group(1).strip()
+    if not expected or len(expected) > _MAX_EXACT_LINE_CONTRACT_CHARS:
+        return None
+    return expected
+
+
+def _exact_line_contract_sha256(expected: str) -> str:
+    return hashlib.sha256(expected.encode("utf-8")).hexdigest()
+
+
+def _drop_exact_line_contract_scaffolding(messages: List[Dict[str, Any]]) -> None:
+    messages[:] = [
+        message
+        for message in messages
+        if not (
+            isinstance(message, dict)
+            and message.get("_exact_line_contract_synthetic")
+        )
+    ]
 
 
 def _restore_user_after_reference_handoff(
@@ -1473,6 +1508,19 @@ def run_conversation(
         except Exception:
             pass
 
+    exact_line_contract = _extract_exact_line_contract(user_message)
+    if (
+        getattr(agent, "platform", "") != "slack"
+        or os.environ.get("HERMES_KANBAN_TASK")
+    ):
+        exact_line_contract = None
+    exact_line_contract_retries = 0
+    exact_line_contract_failed = False
+    if exact_line_contract is not None:
+        # A strict terminal cannot be validated until the full response is
+        # available. Do not leak an unverified prefix through TTS callbacks.
+        stream_callback = None
+
     # The gateway caches agents across user turns.  Compression state is
     # per-turn: carrying a prior in-place boundary forward would make a later
     # uncompressed result look like a compacted transcript to gateway writers.
@@ -2555,6 +2603,14 @@ def run_conversation(
                     _original_api_kwargs = dict(api_kwargs)
                     _llm_middleware_trace = []
 
+                if exact_line_contract is not None:
+                    # This protocol is a terminal-only Slack receipt. Neither
+                    # the model nor request middleware may turn it into a tool
+                    # execution path.
+                    for payload in (api_kwargs, _original_api_kwargs):
+                        payload.pop("tools", None)
+                        payload.pop("tool_choice", None)
+
                 try:
                     from hermes_cli.lifecycle import (
                         has_hook,
@@ -2641,7 +2697,7 @@ def run_conversation(
                     if agent.thinking_callback:
                         agent.thinking_callback("")
 
-                _use_streaming = True
+                _use_streaming = exact_line_contract is None
                 # Provider signaled "stream not supported" on a previous
                 # attempt — switch to non-streaming for the rest of this
                 # session instead of re-failing every retry.
@@ -3833,6 +3889,18 @@ def run_conversation(
                 api_elapsed = time.time() - api_start_time
                 agent._vprint(f"{agent.log_prefix}⚡ Interrupted during API call.", force=True)
                 interrupted = True
+                if exact_line_contract is not None:
+                    expected_sha256 = _exact_line_contract_sha256(
+                        exact_line_contract
+                    )
+                    _drop_exact_line_contract_scaffolding(messages)
+                    final_response = (
+                        "TERMINAL_CONTRACT_INTERRUPTED "
+                        f"expected_sha256={expected_sha256}"
+                    )
+                    _turn_exit_reason = "terminal_contract_interrupted"
+                    agent._persist_session(messages, conversation_history)
+                    break
                 # Preserve any assistant text already streamed to the user
                 # before the stop landed. Dropping it leaves history with no
                 # record of the half-finished reply on screen, so the next turn
@@ -3857,6 +3925,35 @@ def run_conversation(
                     thinking_spinner = None
                 if agent.thinking_callback:
                     agent.thinking_callback("")
+
+                if exact_line_contract is not None:
+                    expected_sha256 = _exact_line_contract_sha256(
+                        exact_line_contract
+                    )
+                    error_type = type(api_error).__name__
+                    _drop_exact_line_contract_scaffolding(messages)
+                    failed = True
+                    _turn_exit_reason = "terminal_contract_provider_error"
+                    final_response = (
+                        "TERMINAL_CONTRACT_PROVIDER_ERROR "
+                        f"expected_sha256={expected_sha256} "
+                        f"error_type={error_type}"
+                    )
+                    logger.warning(
+                        "Exact-line terminal provider failure "
+                        "(expected_sha256=%s error_type=%s)",
+                        expected_sha256,
+                        error_type,
+                    )
+                    agent._persist_session(messages, conversation_history)
+                    return {
+                        "final_response": final_response,
+                        "messages": messages,
+                        "api_calls": api_call_count,
+                        "completed": False,
+                        "failed": True,
+                        "turn_exit_reason": _turn_exit_reason,
+                    }
 
                 # -----------------------------------------------------------
                 # UnicodeEncodeError recovery.  Two common causes:
@@ -6142,8 +6239,70 @@ def run_conversation(
             except Exception:
                 pass
 
+            if exact_line_contract is not None:
+                observed = agent._strip_think_blocks(
+                    assistant_message.content or ""
+                ).strip()
+                contract_matched = (
+                    not assistant_message.tool_calls
+                    and observed == exact_line_contract
+                )
+                if contract_matched:
+                    assistant_message.content = observed
+                    finish_reason = "stop"
+                elif exact_line_contract_retries < 1:
+                    exact_line_contract_retries += 1
+                    logger.warning(
+                        "Exact-line terminal contract mismatch; retrying "
+                        "once (expected_chars=%d observed_chars=%d tools=%d)",
+                        len(exact_line_contract),
+                        len(observed),
+                        len(assistant_message.tool_calls or []),
+                    )
+                    interim_msg = agent._build_assistant_message(
+                        assistant_message,
+                        "incomplete",
+                    )
+                    interim_msg["content"] = observed
+                    interim_msg["tool_calls"] = None
+                    interim_msg["_exact_line_contract_synthetic"] = True
+                    messages.append(interim_msg)
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            "Return the exact terminal line below in full and "
+                            "nothing else:\n" + exact_line_contract
+                        ),
+                        "_exact_line_contract_synthetic": True,
+                    })
+                    agent._session_messages = messages
+                    continue
+                else:
+                    observed_chars = len(observed)
+                    expected_sha256 = _exact_line_contract_sha256(
+                        exact_line_contract
+                    )
+                    assistant_message.content = (
+                        "TERMINAL_CONTRACT_INCOMPLETE "
+                        f"expected_sha256={expected_sha256} "
+                        f"observed_chars={observed_chars}"
+                    )
+                    assistant_message.tool_calls = None
+                    finish_reason = "stop"
+                    exact_line_contract_failed = True
+                    logger.warning(
+                        "Exact-line terminal contract remained incomplete "
+                        "after retry (expected_sha256=%s observed_chars=%d)",
+                        expected_sha256,
+                        observed_chars,
+                    )
+
             # Handle assistant response
-            if assistant_message.content and not agent.quiet_mode:
+            if (
+                exact_line_contract is None
+                and assistant_message.content
+                and not agent.quiet_mode
+            ):
                 if agent.verbose_logging:
                     agent._vprint(f"{agent.log_prefix}🤖 Assistant: {assistant_message.content}")
                 else:
@@ -6151,7 +6310,11 @@ def run_conversation(
 
             # Notify progress callback of model's thinking (used by subagent
             # delegation to relay the child's reasoning to the parent display).
-            if (assistant_message.content and agent.tool_progress_callback):
+            if (
+                exact_line_contract is None
+                and assistant_message.content
+                and agent.tool_progress_callback
+            ):
                 _think_text = assistant_message.content.strip()
                 # Strip reasoning XML tags that shouldn't leak to parent display
                 _think_text = re.sub(
@@ -7263,15 +7426,20 @@ def run_conversation(
                     messages.append(assistant_msg)
 
                     if reasoning_text:
-                        reasoning_preview = reasoning_text[:500] + "..." if len(reasoning_text) > 500 else reasoning_text
+                        reasoning_sha256 = hashlib.sha256(
+                            reasoning_text.encode("utf-8", errors="replace")
+                        ).hexdigest()
                         logger.warning(
                             "Reasoning-only response (no visible content) "
                             "after exhausting retries and fallback. "
-                            "Reasoning: %s", reasoning_preview,
+                            "reasoning_sha256=%s reasoning_chars=%d",
+                            reasoning_sha256,
+                            len(reasoning_text),
                         )
                         agent._emit_status(
                             "⚠️ Model produced reasoning but no visible "
-                            "response after all retries. Returning empty."
+                            "response after all retries. Returning a "
+                            "fail-closed terminal."
                         )
                     else:
                         logger.warning(
@@ -7287,25 +7455,13 @@ def run_conversation(
                                ". No fallback providers configured.")
                         )
 
-                    # Deliver a labeled reasoning excerpt instead of a bare
-                    # "(empty)" when the model DID think but never produced
-                    # visible text. This is delivery-only: the persisted
-                    # assistant message above keeps the "(empty)" sentinel
-                    # (its replay semantics prevent empty-response loops),
-                    # and raw chain-of-thought is never promoted to a normal
-                    # answer earlier in the ladder — prefill continuation,
-                    # empty-content retries, and provider fallback all run
-                    # first. Only at this terminal, where the alternative is
-                    # returning nothing, is showing the model's own reasoning
-                    # (clearly labeled as such) strictly more useful.
-                    # Idea credit: PR #48795 (@ligl0325).
+                    # Keep the failure observable without promoting internal
+                    # reasoning into user-visible content or durable history.
                     if reasoning_text:
                         final_response = (
-                            "⚠️ The model produced only internal reasoning and "
-                            "no final answer, despite retries"
-                            + (" and fallback" if agent._fallback_chain else "")
-                            + ". Its last reasoning, which may contain the "
-                            "answer:\n\n" + reasoning_preview
+                            "MODEL_EMPTY_TERMINAL "
+                            f"reasoning_sha256={reasoning_sha256} "
+                            f"reasoning_chars={len(reasoning_text)}"
                         )
                     else:
                         final_response = "(empty)"
@@ -7327,6 +7483,8 @@ def run_conversation(
 
                 _ack_mode = intent_ack_continuation_mode(agent)
                 if (
+                    exact_line_contract is None
+                    and
                     _ack_mode != "off"
                     and agent.valid_tool_names
                     and codex_ack_continuations < 2
@@ -7367,8 +7525,10 @@ def run_conversation(
                             _frag.pop("_length_continuation_nudge", None)
                 
                 final_response = agent._strip_think_blocks(final_response).strip()
-                
+
                 final_msg = agent._build_assistant_message(assistant_message, finish_reason)
+                if exact_line_contract_failed:
+                    final_msg["content"] = final_response
 
                 # ── Dropped tool-call recovery (copilot/Claude) ────────
                 # Some providers (observed: claude-opus-4.8 / claude-sonnet-4.5
@@ -7437,6 +7597,7 @@ def run_conversation(
                         or messages[-1].get("_empty_recovery_synthetic")
                         or messages[-1].get("_empty_terminal_sentinel")
                         or messages[-1].get("_dropped_toolcall_nudge")
+                        or messages[-1].get("_exact_line_contract_synthetic")
                     )
                 ):
                     messages.pop()
@@ -7447,7 +7608,9 @@ def run_conversation(
                         verify_on_stop_enabled,
                     )
 
-                    if verify_on_stop_enabled():
+                    if exact_line_contract is not None:
+                        _verify_nudge = None
+                    elif verify_on_stop_enabled():
                         _verify_nudge = build_verify_on_stop_nudge(
                             session_id=getattr(agent, "session_id", None),
                             changed_paths=getattr(agent, "_turn_file_mutation_paths", set()),
@@ -7513,7 +7676,12 @@ def run_conversation(
                     from hermes_cli.lifecycle import has_hook
                     from hermes_cli.plugins import get_pre_verify_continue_message
 
-                    if _edited and has_hook("pre_verify") and _attempt < max_verify_nudges():
+                    if (
+                        exact_line_contract is None
+                        and _edited
+                        and has_hook("pre_verify")
+                        and _attempt < max_verify_nudges()
+                    ):
                         # Posture is fixed for the session — resolve once + cache.
                         coding = getattr(agent, "_resolved_is_coding", None)
                         if coding is None:
@@ -7571,10 +7739,13 @@ def run_conversation(
                 try:
                     from agent.kanban_stop import build_kanban_stop_nudge
 
-                    _kanban_nudge = build_kanban_stop_nudge(
-                        messages=messages,
-                        attempts=getattr(agent, "_kanban_stop_nudges", 0),
-                    )
+                    if exact_line_contract is None:
+                        _kanban_nudge = build_kanban_stop_nudge(
+                            messages=messages,
+                            attempts=getattr(agent, "_kanban_stop_nudges", 0),
+                        )
+                    else:
+                        _kanban_nudge = None
                 except Exception:
                     logger.debug("kanban stop-loop check failed", exc_info=True)
                     _kanban_nudge = None
@@ -7631,7 +7802,10 @@ def run_conversation(
                         exc_info=True,
                     )
 
-                _turn_exit_reason = f"text_response(finish_reason={finish_reason})"
+                if exact_line_contract_failed:
+                    _turn_exit_reason = "terminal_contract_incomplete"
+                else:
+                    _turn_exit_reason = f"text_response(finish_reason={finish_reason})"
                 if not agent.quiet_mode:
                     agent._safe_print(f"🎉 Conversation completed after {api_call_count} OpenAI-compatible API call(s)")
                 break
@@ -7746,7 +7920,9 @@ def run_conversation(
         turn_id=turn_id,
         user_message=user_message,
         original_user_message=original_user_message,
-        _should_review_memory=_should_review_memory,
+        _should_review_memory=(
+            False if exact_line_contract is not None else _should_review_memory
+        ),
         _turn_exit_reason=_turn_exit_reason,
         _pending_verification_response=_pending_verification_response,
         _pending_verification_response_previewed=_pending_verification_response_previewed,
