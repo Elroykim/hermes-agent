@@ -1,0 +1,58 @@
+{
+  "schema_version": "thewon-p0-ledger/v1",
+  "issue_id": "P0-EVIDENCE-R7-20260811",
+  "run_id": "p0-r7-20260811",
+  "owner_bac": "CK",
+  "base_commit": "af37881b93a393cfe0ee24666709af0fcbda6109",
+  "status": "CANDIDATE_ONLY_AWAITING_STANDING_GV",
+  "lease_id": "lease-p0-r7-20260811",
+  "lease_scope": {
+    "mutation_boundary": [
+      "docs/thewon/p0/README.md",
+      "docs/thewon/p0/candidate-manifest-r7-20260811.json",
+      "docs/thewon/p0/evidence-ledger.json",
+      "docs/thewon/p0/snapshots/r7-prestate-20260811.json",
+      "hermes_cli/thewon_p0_candidate_scope.py",
+      "hermes_cli/thewon_p0_evidence.py",
+      "hermes_cli/thewon_p0_review.py",
+      "scripts/thewon_p0_capture_snapshot.py",
+      "scripts/thewon_p0_verify_candidate_scope.py",
+      "scripts/thewon_p0_verify_roundtrip.py",
+      "tests/hermes_cli/test_thewon_p0_candidate_scope.py",
+      "tests/hermes_cli/test_thewon_p0_evidence.py",
+      "tests/hermes_cli/test_thewon_p0_review.py"
+    ],
+    "acquired_resources": [
+      "docs/thewon/p0/README.md",
+      "docs/thewon/p0/candidate-manifest-r7-20260811.json",
+      "docs/thewon/p0/evidence-ledger.json",
+      "docs/thewon/p0/snapshots/r7-prestate-20260811.json",
+      "hermes_cli/thewon_p0_candidate_scope.py",
+      "hermes_cli/thewon_p0_evidence.py",
+      "hermes_cli/thewon_p0_review.py",
+      "scripts/thewon_p0_capture_snapshot.py",
+      "scripts/thewon_p0_verify_candidate_scope.py",
+      "scripts/thewon_p0_verify_roundtrip.py",
+      "tests/hermes_cli/test_thewon_p0_candidate_scope.py",
+      "tests/hermes_cli/test_thewon_p0_evidence.py",
+      "tests/hermes_cli/test_thewon_p0_review.py"
+    ],
+    "released_resources": [
+      "docs/thewon/p0/README.md",
+      "docs/thewon/p0/candidate-manifest-r7-20260811.json",
+      "docs/thewon/p0/evidence-ledger.json",
+      "docs/thewon/p0/snapshots/r7-prestate-20260811.json",
+      "hermes_cli/thewon_p0_candidate_scope.py",
+      "hermes_cli/thewon_p0_evidence.py",
+      "hermes_cli/thewon_p0_review.py",
+      "scripts/thewon_p0_capture_snapshot.py",
+      "scripts/thewon_p0_verify_candidate_scope.py",
+      "scripts/thewon_p0_verify_roundtrip.py",
+      "tests/hermes_cli/test_thewon_p0_candidate_scope.py",
+      "tests/hermes_cli/test_thewon_p0_evidence.py",
+      "tests/hermes_cli/test_thewon_p0_review.py"
+    ]
+  },
+  "rollback": "git revert <candidate-commit>",
+  "live_state": "NOT_APPLIED"
+}

@@ -1,0 +1,10 @@
+{
+  "schema_version": "thewon-p0-prestate/v1",
+  "captured_at": "2026-08-11T00:00:00Z",
+  "base_authority_commit": "af37881b93a393cfe0ee24666709af0fcbda6109",
+  "base_authority_tree": "4b9cbdf2c96d29afb8241ba61efb56a669acc3d2",
+  "candidate_status": "QUARANTINED_NO_DEPLOY_UNTIL_STANDING_GV",
+  "runtime_mutation": false,
+  "slack_mutation": false,
+  "vault_mutation": false
+}
