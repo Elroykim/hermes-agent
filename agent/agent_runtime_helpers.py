@@ -3511,6 +3511,11 @@ def looks_like_codex_intermediate_ack(
 
     has_future_ack = bool(
         re.search(r"\b(i['’]ll|i will|let me|i can do that|i can help with that)\b", assistant_text)
+        or re.search(r"(?:하겠습니다|해보겠습니다|살펴보겠습니다|할게요)(?:[.!?]|$)", assistant_text)
+        or re.search(
+            r"(?:아래|다음).{0,120}(?:초기|첫).{0,40}(?:명령|단계)(?:입니다)?(?:[.!?]|$)",
+            assistant_text,
+        )
     )
     if not has_future_ack:
         return False
@@ -3535,6 +3540,19 @@ def looks_like_codex_intermediate_ack(
         "walkthrough",
         "report back",
         "summarize",
+        "확인",
+        "검토",
+        "살펴",
+        "조사",
+        "분석",
+        "실행",
+        "테스트",
+        "수정",
+        "검색",
+        "찾",
+        "읽",
+        "열",
+        "명령",
     )
     workspace_markers = (
         "directory",

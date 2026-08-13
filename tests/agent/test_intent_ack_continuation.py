@@ -46,6 +46,12 @@ REPRO_ACK = "I will start by running a health check command on the server to see
 CODE_USER = "review the codebase in /app"
 CODE_ACK = "Let me inspect the repository files first."
 
+# Gelver/qwen may announce the same deferred action in Korean. The second
+# fixture is the production failure shape: it introduces "initial commands"
+# but contains no command or result.
+KOREAN_ACK = "먼저 저장소 상태를 확인하겠습니다."
+KOREAN_COMMAND_INTRO = "아래는 Git 상태 확인을 위한 초기 명령입니다."
+
 
 # ── mode resolution ────────────────────────────────────────────────────────
 
@@ -116,9 +122,35 @@ def test_all_path_drops_workspace_requirement():
     )
 
 
+def test_all_path_detects_korean_future_ack():
+    a = _agent(True, "chat_completions", "qwen3.6:35b")
+    msgs = [{"role": "user", "content": CODE_USER}]
+    assert looks_like_codex_intermediate_ack(
+        a, CODE_USER, KOREAN_ACK, msgs, require_workspace=False
+    )
+
+
+def test_all_path_detects_korean_empty_command_intro():
+    a = _agent(True, "chat_completions", "qwen3.6:35b")
+    msgs = [{"role": "user", "content": CODE_USER}]
+    assert looks_like_codex_intermediate_ack(
+        a, CODE_USER, KOREAN_COMMAND_INTRO, msgs, require_workspace=False
+    )
+
+
+def test_all_path_keeps_completed_korean_result_terminal():
+    a = _agent(True, "chat_completions", "qwen3.6:35b")
+    msgs = [{"role": "user", "content": CODE_USER}]
+    assert not looks_like_codex_intermediate_ack(
+        a,
+        CODE_USER,
+        "저장소 상태를 확인했습니다. 변경 사항은 없습니다.",
+        msgs,
+        require_workspace=False,
+    )
+
+
 # ── detector: guardrails that hold regardless of workspace ───────────────────
-
-
 
 
 
