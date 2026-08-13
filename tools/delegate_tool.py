@@ -1318,6 +1318,7 @@ def _build_child_agent(
     override_api_mode: Optional[str] = None,
     override_request_overrides: Optional[Dict[str, Any]] = None,
     override_max_tokens: Optional[int] = None,
+    override_fallback_model: Optional[List[Dict[str, Any]]] = None,
     # ACP transport overrides from trusted delegation config.
     override_acp_command: Optional[str] = None,
     override_acp_args: Optional[List[str]] = None,
@@ -1571,7 +1572,11 @@ def _build_child_agent(
     # from rate-limits and credential exhaustion exactly like the top-level
     # agent does.  _fallback_chain is a list accepted by AIAgent's
     # fallback_model parameter (which handles both list and dict forms).
-    parent_fallback = getattr(parent_agent, "_fallback_chain", None) or None
+    parent_fallback = (
+        override_fallback_model
+        if override_fallback_model is not None
+        else (getattr(parent_agent, "_fallback_chain", None) or None)
+    )
 
     # Inherit the parent's OpenRouter provider-preference filters by default
     # (so subagents routed to the same provider honour the same routing
@@ -3137,6 +3142,8 @@ def delegate_task(
     role: Optional[str] = None,
     background: Optional[bool] = None,
     output_schema: Optional[Dict[str, Any]] = None,
+    sac_type: Optional[str] = None,
+    difficulty: Optional[str] = None,
     parent_agent=None,
 ) -> str:
     """
@@ -3235,7 +3242,13 @@ def delegate_task(
             )
         task_list = tasks
     elif goal and isinstance(goal, str) and goal.strip():
-        single_task: Dict[str, Any] = {"goal": goal, "context": context, "role": top_role}
+        single_task: Dict[str, Any] = {
+            "goal": goal,
+            "context": context,
+            "role": top_role,
+            "sac_type": sac_type,
+            "difficulty": difficulty,
+        }
         if output_schema is not None:
             single_task["output_schema"] = output_schema
         task_list = [single_task]
@@ -3253,6 +3266,22 @@ def delegate_task(
             )
         if not task.get("goal", "").strip():
             return tool_error(f"Task {i} is missing a 'goal'.")
+
+    # Resolve SAC identity and model policy before constructing any child.
+    # This is fail-closed so a mixed batch never partially spawns when one SAC
+    # role is unknown or blocked. Registry tools/ports are metadata only.
+    from tools.sac_profiles import SACProfileError, resolve_sac_profile
+
+    for i, task in enumerate(task_list):
+        requested_sac = task.get("sac_type")
+        if not requested_sac:
+            continue
+        try:
+            task["_sac_profile"] = resolve_sac_profile(
+                requested_sac, task.get("difficulty"), cfg
+            )
+        except SACProfileError as exc:
+            return tool_error(f"Task {i} SAC profile invalid: {exc}")
 
     # Batch-only quality gate: catch malformed fan-outs (placeholder goals,
     # unexpanded multi-word template markers, 1-task batches) before any
@@ -3333,15 +3362,31 @@ def delegate_task(
     for i, t in enumerate(task_list):
         # Per-task role beats top-level; normalise again so unknown
         # per-task values warn and degrade to leaf uniformly.
-        effective_role = _normalize_role(t.get("role") or top_role)
+        _sac_profile = t.get("_sac_profile")
+        effective_role = (
+            "leaf" if _sac_profile else _normalize_role(t.get("role") or top_role)
+        )
         # T1-24: schema'd tasks get the contract appended to their context
         # so the child knows the expected output shape before it starts.
         _task_schema = task_schemas[i] if i < len(task_schemas) else None
         _child_context = t.get("context")
+        if _sac_profile:
+            _child_context = "\n\n".join(
+                part for part in (_sac_profile["prompt"], _child_context) if part
+            )
         if _task_schema is not None:
             from tools.delegation_output_schema import append_output_contract
 
             _child_context = append_output_contract(_child_context, _task_schema)
+        _task_creds = dict(creds)
+        if _sac_profile:
+            _task_creds.update(
+                model=_sac_profile["model"],
+                provider=_sac_profile["provider"],
+                base_url=_sac_profile["base_url"],
+                api_key=_sac_profile["api_key"],
+                api_mode="chat_completions",
+            )
         child = _build_child_preserving_parent_tools(
             task_index=i,
             goal=t["goal"],
@@ -3349,18 +3394,21 @@ def delegate_task(
             # Subagents always inherit the parent's toolsets; the model
             # cannot choose or narrow them (no model-facing toolsets arg).
             toolsets=None,
-            model=creds["model"],
+            model=_task_creds["model"],
             max_iterations=effective_max_iter,
             task_count=n_tasks,
             parent_agent=parent_agent,
-            override_provider=creds["provider"],
-            override_base_url=creds["base_url"],
-            override_api_key=creds["api_key"],
-            override_api_mode=creds["api_mode"],
-            override_request_overrides=creds.get("request_overrides"),
-            override_max_tokens=creds.get("max_output_tokens"),
-            override_acp_command=creds.get("command"),
-            override_acp_args=creds.get("args"),
+            override_provider=_task_creds["provider"],
+            override_base_url=_task_creds["base_url"],
+            override_api_key=_task_creds["api_key"],
+            override_api_mode=_task_creds["api_mode"],
+            override_request_overrides=_task_creds.get("request_overrides"),
+            override_max_tokens=_task_creds.get("max_output_tokens"),
+            override_fallback_model=(
+                _sac_profile["fallback_model"] if _sac_profile else None
+            ),
+            override_acp_command=_task_creds.get("command"),
+            override_acp_args=_task_creds.get("args"),
             role=effective_role,
         )
         # Attach the validated schema for the completion-side validation
@@ -4113,7 +4161,8 @@ def _build_top_level_description() -> str:
         "memory, send_message, or cronjob; orchestrators regain only "
         "delegate_task.\n"
         "- Children inherit the parent model and fallback chain unless pinned "
-        "globally via delegation.provider / delegation.model in config.yaml. "
+        "globally via delegation.provider / delegation.model, or selected as "
+        "a configured MINA SAC specialist with sac_type. "
         "Results are returned as an array, one entry per task."
     )
 
@@ -4226,6 +4275,15 @@ DELEGATE_TASK_SCHEMA = {
                     "specific you are, the better the subagent performs."
                 ),
             },
+            "sac_type": {
+                "type": "string",
+                "description": "Optional MINA SAC registry role for a leaf specialist.",
+            },
+            "difficulty": {
+                "type": "string",
+                "enum": ["light", "standard", "advanced"],
+                "description": "Optional SAC difficulty override; controls the configured model tier.",
+            },
             "tasks": {
                 "type": "array",
                 "items": {
@@ -4235,6 +4293,15 @@ DELEGATE_TASK_SCHEMA = {
                         "context": {
                             "type": "string",
                             "description": "Task-specific context",
+                        },
+                        "sac_type": {
+                            "type": "string",
+                            "description": "Optional MINA SAC registry role for this leaf specialist.",
+                        },
+                        "difficulty": {
+                            "type": "string",
+                            "enum": ["light", "standard", "advanced"],
+                            "description": "Optional SAC difficulty override for this task.",
                         },
                         "role": {
                             "type": "string",
@@ -4348,6 +4415,8 @@ registry.register(
         role=args.get("role"),
         background=_model_background_value(args, kw.get("parent_agent")),
         output_schema=args.get("output_schema"),
+        sac_type=args.get("sac_type"),
+        difficulty=args.get("difficulty"),
         parent_agent=kw.get("parent_agent"),
     ),
     check_fn=check_delegate_requirements,

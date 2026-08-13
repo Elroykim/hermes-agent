@@ -1802,6 +1802,24 @@ DEFAULT_CONFIG = {
         # Flip to true only if you trust delegated work to run dangerous cmds
         # without human review (cron pipelines, batch automation, etc.).
         "subagent_auto_approve": False,
+        "sac": {
+            "enabled": False,
+            "registry_path": "",
+            "provider": "custom",
+            "base_url": "http://localhost:11434/v1",
+            "api_key": "ollama",
+            "default_model": "deepseek-v4-flash:cloud",
+            "fallback_model": "qwen3.5:122b",
+            "expected_catalog_roles": 32,
+            "allow_expert": False,
+            "model_by_difficulty": {
+                "light": "deepseek-v4-flash:cloud",
+                "standard": "deepseek-v4-flash:cloud",
+                "advanced": "deepseek-v4-pro:cloud",
+                "expert": "deepseek-v4-pro:cloud",
+            },
+            "blocked_roles": ["cto_agent", "cso_agent", "cdo_agent"],
+        },
     },
 
     # Ephemeral prefill messages file — JSON list of {role, content} dicts
