@@ -180,6 +180,7 @@ def _run_and_exit_oneshot(
     provider: object = None,
     toolsets: object = None,
     usage_file: object = None,
+    workspace: object = None,
 ) -> None:
     try:
         from hermes_cli.oneshot import run_oneshot
@@ -190,6 +191,7 @@ def _run_and_exit_oneshot(
             provider=provider,
             toolsets=toolsets,
             usage_file=usage_file,
+            workspace=workspace,
         )
     except KeyboardInterrupt:
         rc = 130
@@ -219,6 +221,40 @@ def _run_and_exit_oneshot(
         # during best-effort cleanup must not fall back into interpreter
         # finalization, where the reported native SIGABRT occurs.
         _exit_after_oneshot(rc)
+
+
+def _prepare_oneshot_context(args) -> str | None:
+    """Apply workspace flags before one-shot startup discovers project context.
+
+    One-shot mode bypasses :func:`cmd_chat`, where ``--in`` and resume flags
+    are normally handled.  Silently ignoring those flags can bind tools and
+    AGENTS.md discovery to an unrelated prior directory, so workspace entry
+    happens here and unsupported session continuation fails closed.
+    """
+    if getattr(args, "resume", None) or getattr(args, "continue_last", None):
+        print(
+            "Error: --oneshot cannot be combined with --resume or --continue. "
+            "Use `hermes chat --quiet --resume <session> -q <prompt>` for a "
+            "resumed non-interactive turn.",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+
+    in_dir = getattr(args, "in_dir", None)
+    if not in_dir:
+        return None
+
+    target_dir = os.path.abspath(os.path.expanduser(in_dir))
+    if not os.path.isdir(target_dir):
+        print(f"Error: --in directory not found: {in_dir}", file=sys.stderr)
+        raise SystemExit(1)
+    try:
+        os.chdir(target_dir)
+    except OSError as exc:
+        print(f"Error: cannot enter --in directory {in_dir}: {exc}", file=sys.stderr)
+        raise SystemExit(1) from exc
+    args.no_restore_cwd = True
+    return target_dir
 
 
 def _project_root_str_fast() -> str:
@@ -11003,6 +11039,9 @@ def _try_fast_chat_launch() -> bool:
 
     if getattr(args, "yolo", False):
         os.environ["HERMES_YOLO_MODE"] = "1"
+    oneshot_workspace = None
+    if getattr(args, "oneshot", None):
+        oneshot_workspace = _prepare_oneshot_context(args)
     _prepare_agent_startup(args)
 
     if getattr(args, "oneshot", None):
@@ -11012,6 +11051,7 @@ def _try_fast_chat_launch() -> bool:
             provider=getattr(args, "provider", None),
             toolsets=getattr(args, "toolsets", None),
             usage_file=getattr(args, "usage_file", None),
+            workspace=oneshot_workspace,
         )
 
     if (args.resume or args.continue_last) and args.command is None:
@@ -11061,6 +11101,7 @@ def _try_termux_fast_cli_launch() -> bool:
         return True
 
     if getattr(args, "oneshot", None):
+        oneshot_workspace = _prepare_oneshot_context(args)
         _prepare_agent_startup(args)
         _run_and_exit_oneshot(
             args.oneshot,
@@ -11068,6 +11109,7 @@ def _try_termux_fast_cli_launch() -> bool:
             provider=getattr(args, "provider", None),
             toolsets=getattr(args, "toolsets", None),
             usage_file=getattr(args, "usage_file", None),
+            workspace=oneshot_workspace,
         )
 
     if (args.resume or args.continue_last) and args.command is None:
@@ -12746,6 +12788,10 @@ def main():
     if getattr(args, "yolo", False):
         os.environ["HERMES_YOLO_MODE"] = "1"
 
+    oneshot_workspace = None
+    if getattr(args, "oneshot", None):
+        oneshot_workspace = _prepare_oneshot_context(args)
+
     # Discover Python plugins and register shell hooks once, before any
     # command that can fire lifecycle hooks.  Both are idempotent; gated
     # so introspection/management commands (hermes hooks list, cron
@@ -12762,6 +12808,7 @@ def main():
             provider=getattr(args, "provider", None),
             toolsets=getattr(args, "toolsets", None),
             usage_file=getattr(args, "usage_file", None),
+            workspace=oneshot_workspace,
         )
 
     # Handle top-level --resume / --continue as shortcut to chat
