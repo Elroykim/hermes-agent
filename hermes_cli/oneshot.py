@@ -173,6 +173,7 @@ def run_oneshot(
     provider: Optional[str] = None,
     toolsets: object = None,
     usage_file: Optional[str] = None,
+    workspace: Optional[str] = None,
 ) -> int:
     """Execute a single prompt and print only the final content block.
 
@@ -187,6 +188,7 @@ def run_oneshot(
             cost, token counts, model, api_calls) is written there after the
             run — even when the run fails — so pipelines can account for
             spend per invocation.
+        workspace: Optional absolute workspace bound to this run's tool task.
 
     Returns the exit code.  The caller owns process termination.
     """
@@ -248,6 +250,7 @@ def run_oneshot(
                     provider=provider,
                     toolsets=explicit_toolsets,
                     use_config_toolsets=use_config_toolsets,
+                    workspace=workspace,
                 )
             except BaseException as exc:  # noqa: BLE001
                 # Capture anything that escapes the agent (including OSError
@@ -319,12 +322,44 @@ def _create_session_db_for_oneshot():
         return None
 
 
+def _bind_oneshot_workspace(agent: object, workspace: Optional[str]) -> str | None:
+    """Bind an explicit one-shot workspace to the agent's tool task id."""
+    if not workspace:
+        return None
+
+    from tools.terminal_tool import register_task_env_overrides
+
+    task_id = str(getattr(agent, "session_id", "") or "")
+    if not task_id:
+        raise RuntimeError("oneshot workspace requires a bound session id")
+    register_task_env_overrides(task_id, {"cwd": workspace})
+    return task_id
+
+
+def _pin_oneshot_workspace_context(workspace: Optional[str]):
+    """Pin prompt/context discovery to the same explicit workspace as tools."""
+    if not workspace:
+        return None
+
+    from agent.runtime_cwd import reset_session_cwd, set_session_cwd
+
+    return reset_session_cwd, set_session_cwd(workspace)
+
+
+def _reset_oneshot_workspace_context(handle) -> None:
+    if handle is None:
+        return
+    reset_session_cwd, token = handle
+    reset_session_cwd(token)
+
+
 def _run_agent(
     prompt: str,
     model: Optional[str] = None,
     provider: Optional[str] = None,
     toolsets: object = None,
     use_config_toolsets: bool = True,
+    workspace: Optional[str] = None,
 ) -> tuple[str, dict]:
     """Build an AIAgent exactly like a normal CLI chat turn would, then
     run a single conversation.  Returns ``(final_response, run_result)``."""
@@ -424,6 +459,8 @@ def _run_agent(
     # raises on a provider/config error. The one-shot exit path hard-exits via
     # os._exit and skips finalizers, so an un-closed connection here would leak.
     agent = None
+    workspace_task_id: str | None = None
+    workspace_context = _pin_oneshot_workspace_context(workspace)
     try:
         # Read the effective fallback chain from profile config so oneshot
         # workers honour the same merge semantics as interactive CLI and
@@ -457,13 +494,15 @@ def _run_agent(
             clarify_callback=_oneshot_clarify_callback,
         )
 
+        workspace_task_id = _bind_oneshot_workspace(agent, workspace)
+
         # Belt-and-braces: make sure AIAgent doesn't invoke any streaming
         # display callbacks that would bypass our stdout capture.
         agent.suppress_status_output = True
         agent.stream_delta_callback = None
         agent.tool_gen_callback = None
 
-        result = agent.run_conversation(prompt)
+        result = agent.run_conversation(prompt, task_id=workspace_task_id)
         return (result.get("final_response") or "", result)
     finally:
         # Ordering deliberately mirrors gateway/run.py:_cleanup_agent_resources,
@@ -482,6 +521,14 @@ def _run_agent(
                 agent.close()
             except Exception:
                 logging.debug("oneshot agent cleanup failed", exc_info=True)
+        if workspace_task_id:
+            try:
+                from tools.terminal_tool import clear_task_env_overrides
+
+                clear_task_env_overrides(workspace_task_id)
+            except Exception:
+                logging.debug("oneshot workspace cleanup failed", exc_info=True)
+        _reset_oneshot_workspace_context(workspace_context)
         # agent.close() calls session_db.end_session() but leaves the connection
         # open; close it here to checkpoint the WAL before os._exit skips
         # finalizers.
