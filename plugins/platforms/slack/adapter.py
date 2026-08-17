@@ -880,6 +880,13 @@ class SlackAdapter(BasePlatformAdapter):
     """
 
     MAX_MESSAGE_LENGTH = 39000  # Slack API allows 40,000 chars; leave margin
+    # Streaming/status edits are repeatedly sent through ``chat.update`` and
+    # may be measured more strictly than a final ``chat.postMessage`` payload
+    # (notably after mrkdwn expansion or when stale Block Kit content exists).
+    # Keep edits intentionally compact; the final answer still travels through
+    # ``send()`` and retains its normal multi-part delivery contract.
+    MAX_EDIT_MESSAGE_LENGTH = 12000
+    MAX_EDIT_RETRY_LENGTH = 8000
     supports_code_blocks = True  # Slack mrkdwn renders fenced code blocks
     # Slack's typing indicator is a text status line (assistant.threads
     # .setStatus), so the gateway feeds it live per-tool phrases.
@@ -2738,11 +2745,10 @@ class SlackAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Not connected")
         try:
             formatted = self.format_message(content)
-            # Slack's chat.update has the same ~40k char limit as postMessage.
-            # Unlike send() we can't split into multiple messages (we're
-            # editing an existing one), so truncate to fit — an oversized
-            # payload fails the whole edit with ``msg_too_long``.
-            chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
+            # Unlike send() we cannot split one existing message into several
+            # edits. Keep progressive/status text compact so a large tool trace
+            # cannot make the entire update fail with ``msg_too_long``.
+            chunks = self.truncate_message(formatted, self.MAX_EDIT_MESSAGE_LENGTH)
             formatted = chunks[0] if chunks else formatted
             update_kwargs: Dict[str, Any] = {
                 "channel": chat_id,
@@ -2762,14 +2768,23 @@ class SlackAdapter(BasePlatformAdapter):
                     chat_id, team_id=self._metadata_team_id(metadata)
                 ).chat_update(**update_kwargs)
             except Exception as e:
-                if update_kwargs.get("blocks") and self._is_block_payload_rejection(e):
+                if self._is_block_payload_rejection(e):
                     retry_kwargs = dict(update_kwargs)
                     # Explicitly clear any stale blocks when falling back to the
                     # flat text update path; otherwise Slack can preserve the
                     # prior block layout for an edited message.
                     retry_kwargs["blocks"] = []
+                    if "msg_too_long" in str(e) or getattr(
+                        getattr(e, "response", None), "get", lambda *_: None
+                    )("error") == "msg_too_long":
+                        retry_chunks = self.truncate_message(
+                            formatted, self.MAX_EDIT_RETRY_LENGTH
+                        )
+                        retry_kwargs["text"] = (
+                            retry_chunks[0] if retry_chunks else formatted
+                        )
                     logger.info(
-                        "[Slack] Block Kit payload rejected; retrying edit without blocks: %s",
+                        "[Slack] Edit payload rejected; retrying compact text without blocks: %s",
                         e,
                     )
                     await self._get_client(

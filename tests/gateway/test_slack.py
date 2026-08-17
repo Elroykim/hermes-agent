@@ -2424,7 +2424,7 @@ class TestEditMessage:
         result = await adapter.edit_message("C123", "1234.5678", "x" * 45000)
         assert result.success
         kwargs = adapter._app.client.chat_update.call_args.kwargs
-        assert len(kwargs["text"]) <= adapter.MAX_MESSAGE_LENGTH
+        assert len(kwargs["text"]) <= adapter.MAX_EDIT_MESSAGE_LENGTH
 
 
 # ---------------------------------------------------------------------------
@@ -4558,4 +4558,3 @@ class TestSlackUserAgent:
         """Module constant matches the HermesAgent/<version> convention used
         elsewhere in the codebase for platform-partner attribution."""
         assert _slack_mod._HERMES_SLACK_USER_AGENT_PREFIX.startswith("HermesAgent/")
-

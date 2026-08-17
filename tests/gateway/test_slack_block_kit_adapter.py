@@ -136,6 +136,25 @@ class TestEditMessageBlocks:
         assert second["text"]
 
     @pytest.mark.asyncio
+    async def test_plain_streaming_msg_too_long_retries_with_compact_text(self):
+        adapter, client = _make_adapter()
+        client.chat_update = AsyncMock(
+            side_effect=[SlackRejectedBlocks("msg_too_long"), {"ts": "111.222"}]
+        )
+
+        result = await adapter.edit_message(
+            "C1", "111.222", "x" * (adapter.MAX_EDIT_MESSAGE_LENGTH + 500)
+        )
+
+        assert result.success is True
+        assert client.chat_update.await_count == 2
+        first = client.chat_update.await_args_list[0].kwargs
+        second = client.chat_update.await_args_list[1].kwargs
+        assert len(first["text"]) <= adapter.MAX_EDIT_MESSAGE_LENGTH
+        assert len(second["text"]) <= adapter.MAX_EDIT_RETRY_LENGTH
+        assert second["blocks"] == []
+
+    @pytest.mark.asyncio
     async def test_timeout_error_on_edit_is_retryable_transient(self):
         adapter, client = _make_adapter()
         client.chat_update = AsyncMock(side_effect=TimeoutError("timed out"))
@@ -183,5 +202,4 @@ class TestMarkdownBlockMode:
         kwargs = client.chat_update.await_args.kwargs
         assert kwargs["blocks"][0]["type"] == "markdown"
         assert kwargs["blocks"][0]["text"] == RICH_TABLE_MD
-
 
