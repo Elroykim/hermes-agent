@@ -16296,11 +16296,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # next turn makes more progress. Wrapped in try/except so a
             # broken judge never breaks normal message handling.
             try:
-                _final_text = ""
-                if isinstance(_agent_result, dict):
-                    _final_text = str(_agent_result.get("final_response") or "")
-                elif isinstance(_agent_result, str):
-                    _final_text = _agent_result
+                _final_text = self._goal_supervision_final_text(_agent_result, event)
                 # Skip for empty responses (interrupted / errored) — the
                 # judge would almost always say "continue" and we'd loop
                 # on error. Let the user drive the next turn.
@@ -16315,6 +16311,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             source=source,
                             final_response=_final_text,
                         )
+                if hasattr(event, "_mina_supervision_final_response"):
+                    delattr(event, "_mina_supervision_final_response")
             except Exception as _goal_exc:
                 logger.debug("goal continuation hook failed: %s", _goal_exc)
             return _agent_result
@@ -18868,6 +18866,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             )
                     except Exception as _e:
                         logger.debug("trailing footer send failed: %s", _e)
+                # The adapter must still return None to prevent duplicate chat
+                # delivery, but the outer turn wrapper needs the final text for
+                # MINA's governed turn-end review. Keep it on this per-turn
+                # event only; the wrapper consumes and clears it immediately.
+                setattr(event, "_mina_supervision_final_response", response or "")
                 return None
 
             return response
@@ -19578,6 +19581,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.debug("goal continuation: post-delivery callback registration failed: %s", exc)
 
         await _deliver()
+
+    @staticmethod
+    def _goal_supervision_final_text(agent_result, event) -> str:
+        """Recover final text without changing adapter delivery semantics."""
+        if isinstance(agent_result, dict):
+            return str(agent_result.get("final_response") or "")
+        if isinstance(agent_result, str):
+            return agent_result
+        return str(getattr(event, "_mina_supervision_final_response", "") or "")
 
     async def _post_turn_goal_continuation(
         self,

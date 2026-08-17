@@ -937,6 +937,80 @@ def _goal_judge_max_tokens() -> int:
     return DEFAULT_JUDGE_MAX_TOKENS
 
 
+def _final_goal_judge_max_tokens() -> int:
+    """Resolve the independent final supervisor output budget."""
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config()
+        value = (
+            (cfg.get("auxiliary") or {})
+            .get("goal_final_judge", {})
+            .get("max_tokens", DEFAULT_JUDGE_MAX_TOKENS)
+        )
+        value = int(value)
+        if value > 0:
+            return value
+    except Exception:
+        pass
+    return DEFAULT_JUDGE_MAX_TOKENS
+
+
+def verify_goal_final(
+    goal: str,
+    last_response: str,
+    routine_verdict: str,
+    routine_reason: str,
+    *,
+    timeout: float = DEFAULT_JUDGE_TIMEOUT,
+) -> Tuple[str, str, bool]:
+    """Require the configured final supervisor to confirm governed closure.
+
+    Returns ``(verdict, reason, failed)``. Any transport or parse failure is
+    fail-closed as escalation: routine supervision may keep work moving, but
+    it cannot silently promote itself to final completion authority.
+    """
+    if not load_supervision_policy():
+        return routine_verdict, routine_reason, False
+    try:
+        from agent.auxiliary_client import call_llm
+
+        response = call_llm(
+            task="goal_final_judge",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are MINA's independent final supervisor. Confirm closure only "
+                        "when the response contains concrete completion evidence and stays "
+                        "within the user's authority. Reply with JSON only: verdict must be "
+                        "done, stop, continue, or escalate; include reason."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"GOAL:\n{_truncate(goal, 2000)}\n\n"
+                        f"ROUTINE VERDICT: {routine_verdict}\n"
+                        f"ROUTINE REASON: {_truncate(routine_reason, 1000)}\n\n"
+                        f"LAST RESPONSE:\n{_truncate(last_response, _JUDGE_RESPONSE_SNIPPET_CHARS)}"
+                    ),
+                },
+            ],
+            temperature=0,
+            max_tokens=_final_goal_judge_max_tokens(),
+            timeout=timeout,
+        )
+        raw = response.choices[0].message.content or ""
+        verdict, reason, parse_failed, _wait = _parse_judge_response(raw)
+        if parse_failed or verdict in {"wait", "narrow"}:
+            return "escalate", f"final supervisor returned an unusable closure verdict: {reason}", True
+        return verdict, reason, False
+    except Exception as exc:
+        logger.warning("final goal supervisor unavailable: %s", exc)
+        return "escalate", f"final supervisor unavailable: {type(exc).__name__}", True
+
+
 def _parse_judge_response(raw: str) -> Tuple[str, str, bool, Optional[Dict[str, Any]]]:
     """Parse the judge's reply. Fail-open on unusable output.
 
@@ -1878,6 +1952,13 @@ class GoalManager:
             background_processes=background_processes,
             contract=state.contract if state.has_contract() else None,
         )
+        if verdict in {"done", "stop"} and load_supervision_policy():
+            verdict, reason, _final_failed = verify_goal_final(
+                state.goal,
+                last_response,
+                verdict,
+                reason,
+            )
         state.last_verdict = verdict
         state.last_reason = reason
 

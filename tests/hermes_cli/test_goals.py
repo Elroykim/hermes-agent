@@ -109,6 +109,51 @@ class TestJudgeGoal:
         assert reason == "achieved"
 
 
+class TestFinalGoalSupervisor:
+    def test_governed_done_requires_independent_final_confirmation(self, hermes_home):
+        from hermes_cli import goals
+
+        (hermes_home / "config.yaml").write_text(
+            "goals:\n  supervision:\n    enabled: true\n",
+            encoding="utf-8",
+        )
+        replies = [
+            MagicMock(choices=[MagicMock(message=MagicMock(content='{"verdict":"done","reason":"routine"}'))]),
+            MagicMock(choices=[MagicMock(message=MagicMock(content='{"verdict":"done","reason":"verified by Sol"}'))]),
+        ]
+        mgr = goals.GoalManager("final-confirm")
+        mgr.set("ship safely")
+        with patch("agent.auxiliary_client.call_llm", side_effect=replies) as call:
+            decision = mgr.evaluate_after_turn("tests and deployment evidence are complete")
+        assert [item.kwargs["task"] for item in call.call_args_list] == [
+            "goal_judge",
+            "goal_final_judge",
+        ]
+        assert decision["status"] == "done"
+        assert decision["reason"] == "verified by Sol"
+
+    def test_final_supervisor_failure_escalates_instead_of_false_done(self, hermes_home):
+        from hermes_cli import goals
+
+        (hermes_home / "config.yaml").write_text(
+            "goals:\n  supervision:\n    enabled: true\n",
+            encoding="utf-8",
+        )
+        mgr = goals.GoalManager("final-fail-closed")
+        mgr.set("ship safely")
+        with patch(
+            "hermes_cli.goals.judge_goal",
+            return_value=("done", "routine says done", False, None, False),
+        ), patch(
+            "agent.auxiliary_client.call_llm",
+            side_effect=RuntimeError("rate limited"),
+        ):
+            decision = mgr.evaluate_after_turn("looks complete")
+        assert decision["status"] == "paused"
+        assert decision["verdict"] == "escalate"
+        assert "final supervisor unavailable" in decision["reason"]
+
+
 # ──────────────────────────────────────────────────────────────────────
 # GoalManager lifecycle + persistence
 # ──────────────────────────────────────────────────────────────────────

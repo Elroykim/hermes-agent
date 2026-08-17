@@ -68,6 +68,57 @@ goals:
 
 
 @pytest.mark.asyncio
+async def test_ordinary_slack_turn_becomes_supervised_goal(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        """
+goals:
+  supervision:
+    enabled: true
+    auto_activate_platforms: [telegram, slack]
+    checkpoint_minutes: 45
+""".lstrip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    goals._DB_CACHE.clear()
+    runner = object.__new__(GatewayRunner)
+    runner.config = {}
+    monkeypatch.setattr(
+        GatewayRunner,
+        "_set_mina_supervision_heartbeat",
+        lambda self, event, entry: True,
+    )
+    source = SessionSource(
+        platform=Platform.SLACK,
+        chat_id="C123",
+        chat_type="channel",
+        user_id="elroy",
+    )
+    event = MessageEvent(
+        text="변경사항을 검증하고 운영 배포까지 완료해",
+        message_type=MessageType.TEXT,
+        source=source,
+    )
+    try:
+        activated = await GatewayRunner._ensure_auto_supervised_goal(
+            runner, event, source, _SessionEntry()
+        )
+        state = goals.GoalManager(_SessionEntry.session_id).state
+        assert activated is True
+        assert state is not None and state.goal == event.text
+    finally:
+        goals._DB_CACHE.clear()
+
+
+def test_streamed_final_text_is_available_to_supervision_hook():
+    event = type("Event", (), {})()
+    event._mina_supervision_final_response = "streamed final evidence"
+    assert GatewayRunner._goal_supervision_final_text(None, event) == "streamed final evidence"
+
+
+@pytest.mark.asyncio
 async def test_synthetic_continuation_does_not_replace_goal(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
     home.mkdir()
