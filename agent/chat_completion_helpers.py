@@ -1932,6 +1932,13 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
     auth resolution and client construction — no duplicated provider→key
     mappings.
     """
+    if reason in {FailoverReason.rate_limit, FailoverReason.upstream_rate_limit}:
+        try:
+            from agent.thewon_model_mode_bridge import notify_rate_limit
+
+            notify_rate_limit(agent, reason)
+        except Exception as exc:
+            logger.warning("TheWon model-mode bridge failed open for current-turn fallback: %s", exc)
     if reason in {FailoverReason.rate_limit, FailoverReason.billing, FailoverReason.upstream_rate_limit}:
         # Only start cooldown when leaving the primary provider.  If we're
         # already on a fallback and chain-switching, the primary wasn't the

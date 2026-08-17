@@ -62,11 +62,17 @@ def test_format_interval():
 
 
 def test_state_roundtrip():
-    s = HeartbeatState(prompt="check CI", interval_seconds=600, created_at=time.time())
+    s = HeartbeatState(
+        prompt="check CI",
+        interval_seconds=600,
+        created_at=time.time(),
+        owner="mina_goal_supervision",
+    )
     loaded = HeartbeatState.from_json(s.to_json())
     assert loaded.prompt == "check CI"
     assert loaded.interval_seconds == 600
     assert loaded.status == "active"
+    assert loaded.owner == "mina_goal_supervision"
 
 
 def test_is_due_anchors_on_created_then_last_fired():
@@ -131,6 +137,13 @@ def test_manager_persists_across_instances():
     again = HeartbeatManager(session_id="hb-persist-sid")
     assert again.has_heartbeat()
     assert again.state.prompt == "persisted prompt"
+
+
+def test_manager_persists_optional_owner():
+    mgr = HeartbeatManager(session_id="hb-owner-sid")
+    mgr.set("governed checkpoint", 2700, owner="mina_goal_supervision")
+    again = HeartbeatManager(session_id="hb-owner-sid")
+    assert again.state.owner == "mina_goal_supervision"
 
 
 def test_due_prompt_fires_once_and_reanchors():

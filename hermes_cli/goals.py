@@ -87,6 +87,83 @@ DEFAULT_GATE_MAX_RETRIES = 3
 _GATE_OUTPUT_TAIL_CHARS = 3000
 
 
+def load_supervision_policy() -> Dict[str, Any]:
+    """Return the optional governed continuation policy from config.
+
+    The core goal loop remains unchanged when this block is absent.  TheWon
+    projects it for MINA so rate-limit model selection and continuation
+    decisions share configuration without sharing authority.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        config = load_config_readonly() or {}
+    except Exception:
+        return {}
+    goals = config.get("goals") if isinstance(config, dict) else None
+    if not isinstance(goals, dict):
+        return {}
+    policy = goals.get("supervision")
+    if not isinstance(policy, dict) or not policy.get("enabled"):
+        return {}
+    return dict(policy)
+
+
+def auto_supervision_enabled_for_platform(platform: str) -> bool:
+    """Whether ordinary user turns on *platform* should become goals."""
+    policy = load_supervision_policy()
+    allowed = policy.get("auto_activate_platforms")
+    if not isinstance(allowed, list):
+        return False
+    normalized = {
+        str(item).strip().lower()
+        for item in allowed
+        if str(item).strip()
+    }
+    return (platform or "").strip().lower() in normalized
+
+
+def supervision_checkpoint_seconds() -> Optional[int]:
+    """Return a validated 30–60 minute checkpoint interval, when enabled."""
+    policy = load_supervision_policy()
+    if not policy:
+        return None
+    try:
+        minimum = int(policy.get("minimum_checkpoint_minutes", 30))
+        maximum = int(policy.get("maximum_checkpoint_minutes", 60))
+        effective = int(policy.get("checkpoint_minutes", 45))
+    except (TypeError, ValueError):
+        return None
+    if minimum < 30 or maximum > 60 or minimum > maximum:
+        return None
+    if not minimum <= effective <= maximum:
+        return None
+    return effective * 60
+
+
+def supervision_guard_text() -> str:
+    """Render the MINA continuation boundary for judge and worker prompts."""
+    policy = load_supervision_policy()
+    if not policy:
+        return ""
+    lines = [
+        "Governed supervision rules:",
+        "- A continuation verdict never changes the active A/B/C/D model mode.",
+        "- CONTINUE only for a concrete next step already authorized by the "
+        "original user request.",
+        "- NARROW when progress is safe only after reducing the next step or "
+        "blast radius.",
+        "- ESCALATE when progress needs new authority, external approval, or "
+        "a materially expanded scope.",
+        "- STOP when the requested outcome is complete or no useful in-scope step remains.",
+    ]
+    if policy.get("high_risk_action") == "stop_without_elroy":
+        lines.append(
+            "- This is a degraded supervision mode: any high-risk mutation must ESCALATE to Elroy."
+        )
+    return "\n".join(lines)
+
+
 CONTINUATION_PROMPT_TEMPLATE = (
     "[Continuing toward your standing goal]\n"
     "Goal: {goal}\n\n"
@@ -864,7 +941,8 @@ def _parse_judge_response(raw: str) -> Tuple[str, str, bool, Optional[Dict[str, 
     """Parse the judge's reply. Fail-open on unusable output.
 
     Returns ``(verdict, reason, parse_failed, wait_directive)`` where:
-      - ``verdict`` is ``"done"``, ``"continue"``, or ``"wait"``.
+      - ``verdict`` is ``"done"``, ``"continue"``, ``"narrow"``,
+        ``"escalate"``, or ``"wait"``.
       - ``parse_failed`` is True when the judge returned output that couldn't
         be interpreted as the expected JSON verdict (empty body, prose,
         malformed JSON). Callers use it to auto-pause after N consecutive
@@ -921,7 +999,14 @@ def _parse_judge_response(raw: str) -> Tuple[str, str, bool, Optional[Dict[str, 
             done = bool(done_val)
         verdict = "done" if done else "continue"
 
-    if verdict not in {"done", "continue", "wait"}:
+    if verdict not in {
+        "done",
+        "stop",
+        "continue",
+        "narrow",
+        "escalate",
+        "wait",
+    }:
         verdict = "continue"
 
     if verdict != "wait":
@@ -1107,10 +1192,20 @@ def judge_goal(
         # Route through call_llm so auxiliary.goal_judge.* config
         # (provider/model/base_url, extra_body, reasoning_effort, retries)
         # all apply — the direct-create path dropped extra_body (#35566).
+        judge_system_prompt = JUDGE_SYSTEM_PROMPT
+        supervision_guard = supervision_guard_text()
+        if supervision_guard:
+            judge_system_prompt = (
+                f"{judge_system_prompt}\n\n{supervision_guard}\n\n"
+                "In governed mode you may also reply with one of these shapes:\n"
+                '{"verdict": "narrow", "reason": "<safe reduced next step>"}\n'
+                '{"verdict": "stop", "reason": "<complete or no useful next step>"}\n'
+                '{"verdict": "escalate", "reason": "<authority or risk boundary>"}'
+            )
         resp = call_llm(
             task="goal_judge",
             messages=[
-                {"role": "system", "content": JUDGE_SYSTEM_PROMPT},
+                {"role": "system", "content": judge_system_prompt},
                 {"role": "user", "content": prompt},
             ],
             temperature=0,
@@ -1829,16 +1924,32 @@ class GoalManager:
                 "message": f"⏳ Goal parked (judge) — waiting on {tgt}: {reason}",
             }
 
-        if verdict == "done":
+        if verdict in {"done", "stop"}:
             state.status = "done"
             save_goal(self.session_id, state)
+            stopped = verdict == "stop"
             return {
                 "status": "done",
                 "should_continue": False,
                 "continuation_prompt": None,
-                "verdict": "done",
+                "verdict": verdict,
                 "reason": reason,
-                "message": f"✓ Goal achieved: {reason}",
+                "message": (
+                    f"{'■ Goal stopped' if stopped else '✓ Goal achieved'}: {reason}"
+                ),
+            }
+
+        if verdict == "escalate":
+            state.status = "paused"
+            state.paused_reason = f"supervisor escalation: {reason}"
+            save_goal(self.session_id, state)
+            return {
+                "status": "paused",
+                "should_continue": False,
+                "continuation_prompt": None,
+                "verdict": "escalate",
+                "reason": reason,
+                "message": f"⚠ Goal paused for Elroy: {reason}",
             }
 
         # Auto-pause when the judge cannot reach the API at all N turns in a
@@ -1918,18 +2029,28 @@ class GoalManager:
             }
 
         save_goal(self.session_id, state)
+        continuation_verdict = "narrow" if verdict == "narrow" else "continue"
         return {
             "status": "active",
             "should_continue": True,
-            "continuation_prompt": self.next_continuation_prompt(),
-            "verdict": "continue",
+            "continuation_prompt": self.next_continuation_prompt(
+                supervisor_verdict=continuation_verdict,
+                supervisor_reason=reason,
+            ),
+            "verdict": continuation_verdict,
             "reason": reason,
             "message": (
-                f"↻ Continuing toward goal ({state.turns_used}/{state.max_turns}): {reason}"
+                f"↻ {'Narrowing' if continuation_verdict == 'narrow' else 'Continuing'} "
+                f"toward goal ({state.turns_used}/{state.max_turns}): {reason}"
             ),
         }
 
-    def next_continuation_prompt(self) -> Optional[str]:
+    def next_continuation_prompt(
+        self,
+        *,
+        supervisor_verdict: str = "continue",
+        supervisor_reason: str = "",
+    ) -> Optional[str]:
         if not self._state or self._state.status != "active":
             return None
         # Contract takes priority: it carries the verification surface and
@@ -1943,16 +2064,25 @@ class GoalManager:
                     for i, text in enumerate(self._state.subgoals, start=1)
                 )
                 contract_block = f"{contract_block}\n{extra}"
-            return CONTINUATION_PROMPT_WITH_CONTRACT_TEMPLATE.format(
+            prompt = CONTINUATION_PROMPT_WITH_CONTRACT_TEMPLATE.format(
                 goal=self._state.goal,
                 contract_block=contract_block,
             )
-        if self._state.subgoals:
-            return CONTINUATION_PROMPT_WITH_SUBGOALS_TEMPLATE.format(
+        elif self._state.subgoals:
+            prompt = CONTINUATION_PROMPT_WITH_SUBGOALS_TEMPLATE.format(
                 goal=self._state.goal,
                 subgoals_block=self._state.render_subgoals_block(),
             )
-        return CONTINUATION_PROMPT_TEMPLATE.format(goal=self._state.goal)
+        else:
+            prompt = CONTINUATION_PROMPT_TEMPLATE.format(goal=self._state.goal)
+        guard = supervision_guard_text()
+        verdict = (supervisor_verdict or "continue").strip().upper()
+        reason = (supervisor_reason or "no reason provided").strip()
+        if verdict == "NARROW":
+            prompt = f"[Supervisor verdict: NARROW]\nReason: {reason}\n\n{prompt}"
+        if guard:
+            prompt = f"{guard}\n\n{prompt}"
+        return prompt
 
     def render_contract(self) -> str:
         """Public helper for the /goal show + /goal draft slash commands."""

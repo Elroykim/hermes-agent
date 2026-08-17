@@ -2604,6 +2604,123 @@ class GatewaySlashCommandsMixin:
         # Let the normal message handler process it
         return await self._handle_message(retry_event)
 
+    @staticmethod
+    def _mina_supervision_heartbeat_prompt() -> str:
+        return (
+            "[MINA supervised checkpoint] Review the active standing goal, the latest "
+            "evidence, and the remaining work. Continue only with a concrete next step "
+            "inside the original user's authority. Narrow the step when that reduces "
+            "risk. If the work is complete, needs expanded authority, or crosses a "
+            "high-risk boundary in degraded mode, stop and report that clearly. Never "
+            "change the active A/B/C/D model mode from this checkpoint."
+        )
+
+    def _set_mina_supervision_heartbeat(self, event, session_entry) -> bool:
+        """Attach the configured 30–60 minute checkpoint to a goal session.
+
+        A manually configured heartbeat always wins; supervised goals never
+        overwrite unrelated user scheduling.
+        """
+        try:
+            from hermes_cli.goals import supervision_checkpoint_seconds
+            from hermes_cli.heartbeat import HeartbeatManager
+
+            interval = supervision_checkpoint_seconds()
+            if not interval or session_entry is None:
+                return False
+            mgr = HeartbeatManager(session_id=session_entry.session_id)
+            if (
+                mgr.state is not None
+                and mgr.state.owner not in {"", "mina_goal_supervision"}
+            ):
+                return False
+            if mgr.state is not None and not mgr.state.owner:
+                return False
+            mgr.set(
+                self._mina_supervision_heartbeat_prompt(),
+                interval,
+                owner="mina_goal_supervision",
+            )
+            quick_key = self._session_key_for_source(event.source) if event.source else None
+            if quick_key and event.source is not None:
+                self._register_heartbeat_watch(quick_key, event.source, session_entry.session_id)
+            return True
+        except Exception as exc:
+            logger.debug("MINA supervision heartbeat setup failed: %s", exc)
+            return False
+
+    def _transition_mina_supervision_heartbeat(
+        self,
+        *,
+        source,
+        session_id: str,
+        action: str,
+    ) -> None:
+        """Pause/resume/clear only the heartbeat owned by goal supervision."""
+        try:
+            from hermes_cli.heartbeat import HeartbeatManager
+
+            mgr = HeartbeatManager(session_id=session_id)
+            if mgr.state is None or mgr.state.owner != "mina_goal_supervision":
+                return
+            quick_key = self._session_key_for_source(source) if source else None
+            if action == "pause":
+                mgr.pause()
+            elif action == "resume":
+                mgr.resume()
+                if quick_key and source is not None:
+                    self._register_heartbeat_watch(quick_key, source, session_id)
+            elif action == "clear":
+                mgr.clear()
+                if quick_key:
+                    self._unregister_heartbeat_watch(quick_key)
+        except Exception as exc:
+            logger.debug("MINA supervision heartbeat %s failed: %s", action, exc)
+
+    async def _ensure_auto_supervised_goal(self, event, source, session_entry) -> bool:
+        """Make an ordinary MINA Telegram/Slack request a supervised goal.
+
+        Synthetic goal continuations and heartbeat ticks are excluded.  A
+        paused goal is also respected: only the user can resume or replace it.
+        """
+        try:
+            from hermes_cli.goals import GoalManager, auto_supervision_enabled_for_platform
+
+            platform = (
+                source.platform.value
+                if hasattr(source.platform, "value")
+                else str(source.platform)
+            )
+            if not auto_supervision_enabled_for_platform(platform):
+                return False
+            if bool(getattr(event, "internal", False)):
+                return False
+            text = str(getattr(event, "text", "") or "").strip()
+            if not text or text.startswith("[Continuing toward your standing goal]"):
+                return False
+            if text.startswith("[Heartbeat —") or text.startswith("[MINA supervised checkpoint]"):
+                return False
+            mgr = GoalManager(
+                session_id=session_entry.session_id,
+                default_max_turns=self._goal_max_turns_from_config(),
+            )
+            if mgr.is_active():
+                self._set_mina_supervision_heartbeat(event, session_entry)
+                return False
+            if mgr.has_goal():
+                return False
+            mgr.set(text)
+            self._set_mina_supervision_heartbeat(event, session_entry)
+            logger.info(
+                "MINA auto-supervision activated: session=%s platform=%s",
+                session_entry.session_id,
+                platform,
+            )
+            return True
+        except Exception as exc:
+            logger.debug("MINA auto-supervision activation failed: %s", exc)
+            return False
+
     async def _handle_goal_command(self, event: "MessageEvent") -> str:
         """Handle /goal for gateway platforms.
 
@@ -2640,12 +2757,22 @@ class GatewaySlashCommandsMixin:
                     self._clear_goal_pending_continuations(_quick_key, adapter)
             except Exception as exc:
                 logger.debug("goal pause: pending continuation cleanup failed: %s", exc)
+            self._transition_mina_supervision_heartbeat(
+                source=event.source,
+                session_id=session_entry.session_id,
+                action="pause",
+            )
             return t("gateway.goal.paused", goal=state.goal)
 
         if lower == "resume":
             state = mgr.resume()
             if state is None:
                 return t("gateway.goal.no_resume")
+            self._transition_mina_supervision_heartbeat(
+                source=event.source,
+                session_id=session_entry.session_id,
+                action="resume",
+            )
             return t("gateway.goal.resumed", goal=state.goal)
 
         if lower in {"clear", "stop", "done"}:
@@ -2658,6 +2785,11 @@ class GatewaySlashCommandsMixin:
                     self._clear_goal_pending_continuations(_quick_key, adapter)
             except Exception as exc:
                 logger.debug("goal clear: pending continuation cleanup failed: %s", exc)
+            self._transition_mina_supervision_heartbeat(
+                source=event.source,
+                session_id=session_entry.session_id,
+                action="clear",
+            )
             return t("gateway.goal_cleared") if had else t("gateway.no_active_goal")
 
         # /goal wait <pid> [reason] — park the loop on a background process.
@@ -2750,6 +2882,8 @@ class GatewaySlashCommandsMixin:
             state = mgr.set(args, contract=contract)
         except ValueError as exc:
             return t("gateway.goal.invalid", error=str(exc))
+
+        self._set_mina_supervision_heartbeat(event, session_entry)
 
         # Queue the goal text as an immediate first turn so the agent
         # starts making progress. The post-turn hook takes over after.

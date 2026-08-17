@@ -17043,6 +17043,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     await asyncio.to_thread(self._record_telegram_topic_binding, source, session_entry)
                 except Exception:
                     logger.debug("Failed to record Telegram topic binding", exc_info=True)
+
+        # MINA governed supervision is opt-in through goals.supervision.  On
+        # configured messaging platforms an ordinary user request becomes a
+        # standing goal before the turn starts, so the separate goal judge can
+        # decide at every turn boundary whether to continue, narrow, stop, or
+        # escalate. Synthetic continuation/heartbeat turns are excluded by the
+        # helper and a paused goal remains under explicit user control.
+        await self._ensure_auto_supervised_goal(event, source, session_entry)
+
         # Capture and immediately consume was_auto_reset so it does not
         # re-fire on subsequent messages — preventing the cleanup from
         # wiping model/reasoning overrides set between turns (Closes #48031).
@@ -19626,6 +19635,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             ),
         )
         msg = decision.get("message") or ""
+
+        # The 45-minute checkpoint belongs to the supervised goal, not to the
+        # chat forever. Stop it as soon as the judge finishes or pauses the
+        # goal; WAIT keeps it active so the idle checkpoint can re-enter later.
+        if decision.get("status") in {"done", "paused"}:
+            self._transition_mina_supervision_heartbeat(
+                source=source,
+                session_id=sid,
+                action="clear" if decision.get("status") == "done" else "pause",
+            )
 
         # Defer the status line until after the adapter has delivered the
         # agent's visible final response. The judge runs after the response is

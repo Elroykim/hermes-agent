@@ -107,6 +107,7 @@ class HeartbeatState:
     created_at: float = 0.0
     last_fired_at: float = 0.0
     fire_count: int = 0
+    owner: str = ""  # optional subsystem owner (manual when empty)
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False)
@@ -121,6 +122,7 @@ class HeartbeatState:
             created_at=float(data.get("created_at", 0.0) or 0.0),
             last_fired_at=float(data.get("last_fired_at", 0.0) or 0.0),
             fire_count=int(data.get("fire_count", 0) or 0),
+            owner=str(data.get("owner") or ""),
         )
 
     def is_due(self, now: Optional[float] = None) -> bool:
@@ -235,7 +237,13 @@ class HeartbeatManager:
 
     # --- mutation -----------------------------------------------------
 
-    def set(self, prompt: str, interval_seconds: int) -> HeartbeatState:
+    def set(
+        self,
+        prompt: str,
+        interval_seconds: int,
+        *,
+        owner: str = "",
+    ) -> HeartbeatState:
         prompt = (prompt or "").strip()
         if not prompt:
             raise ValueError("heartbeat prompt is empty")
@@ -247,6 +255,7 @@ class HeartbeatManager:
             interval_seconds=interval_seconds,
             status="active",
             created_at=time.time(),
+            owner=(owner or "").strip(),
         )
         self._state = state
         save_heartbeat(self.session_id, state)

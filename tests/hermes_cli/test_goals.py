@@ -60,6 +60,18 @@ class TestParseJudgeResponse:
         assert wait == {"pid": 4242}
         assert reason == "CI running"
 
+    @pytest.mark.parametrize("verdict", ["narrow", "stop", "escalate"])
+    def test_governed_supervision_verdicts(self, verdict):
+        from hermes_cli.goals import _parse_judge_response
+
+        parsed, reason, failed, wait = _parse_judge_response(
+            json.dumps({"verdict": verdict, "reason": "governed reason"})
+        )
+        assert parsed == verdict
+        assert reason == "governed reason"
+        assert failed is False
+        assert wait is None
+
 
 
 
@@ -136,6 +148,58 @@ class TestGoalManager:
         assert prompt is not None
         assert "port goal command to hermes" in prompt
         assert prompt.strip()  # non-empty
+
+    def test_narrow_continues_and_escalate_pauses(self, hermes_home):
+        from hermes_cli import goals
+        from hermes_cli.goals import GoalManager
+
+        mgr = GoalManager(session_id="governed-verdict-sid")
+        mgr.set("clean the repository")
+        with patch.object(
+            goals,
+            "judge_goal",
+            return_value=("narrow", "verify only the touched files", False, None, False),
+        ):
+            decision = mgr.evaluate_after_turn("work remains")
+        assert decision["should_continue"] is True
+        assert decision["verdict"] == "narrow"
+        assert "verify only the touched files" in decision["continuation_prompt"]
+
+        with patch.object(
+            goals,
+            "judge_goal",
+            return_value=("escalate", "push needs Elroy approval", False, None, False),
+        ):
+            decision = mgr.evaluate_after_turn("ready to push")
+        assert decision["should_continue"] is False
+        assert decision["status"] == "paused"
+        assert decision["verdict"] == "escalate"
+
+
+def test_supervision_config_enables_telegram_and_validates_checkpoint(hermes_home):
+    from hermes_cli.goals import (
+        auto_supervision_enabled_for_platform,
+        supervision_checkpoint_seconds,
+        supervision_guard_text,
+    )
+
+    (hermes_home / "config.yaml").write_text(
+        """
+goals:
+  supervision:
+    enabled: true
+    auto_activate_platforms: [telegram, slack]
+    checkpoint_minutes: 45
+    minimum_checkpoint_minutes: 30
+    maximum_checkpoint_minutes: 60
+    high_risk_action: stop_without_elroy
+""".lstrip(),
+        encoding="utf-8",
+    )
+    assert auto_supervision_enabled_for_platform("telegram") is True
+    assert auto_supervision_enabled_for_platform("discord") is False
+    assert supervision_checkpoint_seconds() == 45 * 60
+    assert "high-risk mutation must ESCALATE" in supervision_guard_text()
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -797,4 +861,3 @@ class TestContractAndBackgroundCompose:
         # The judge can return a wait verdict on a contract goal.
         assert verdict == "wait"
         assert wait_directive and wait_directive.get("pid") == 4242
-
