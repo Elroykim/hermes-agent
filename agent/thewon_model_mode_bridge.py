@@ -9,8 +9,15 @@ the Hermes process through this path.
 from __future__ import annotations
 
 import logging
+import hashlib
+import hmac
+import json
+import os
+import secrets
 import subprocess
 import sys
+import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -22,6 +29,51 @@ RATE_LIMIT_REASONS = {
     FailoverReason.rate_limit,
     FailoverReason.upstream_rate_limit,
 }
+IDENTITY_ACTOR = "hermes-rate-limit-bridge"
+
+
+def _write_identity_proof(key_path: Path, request: Mapping[str, Any]) -> Path:
+    if not key_path.is_file():
+        raise ValueError("identity key is missing")
+    stat = key_path.stat()
+    if stat.st_uid != os.getuid() or stat.st_mode & 0o077:
+        raise ValueError("identity key permissions must be owner-only")
+    key = key_path.read_bytes()
+    if len(key) < 32:
+        raise ValueError("identity key must contain at least 32 bytes")
+    issued_at = datetime.now(timezone.utc).isoformat()
+    nonce = secrets.token_hex(16)
+    payload = json.dumps(
+        {
+            "actor": IDENTITY_ACTOR,
+            "issued_at": issued_at,
+            "nonce": nonce,
+            "operation": "degradation",
+            "request": request,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    proof = {
+        "actor": IDENTITY_ACTOR,
+        "operation": "degradation",
+        "issued_at": issued_at,
+        "nonce": nonce,
+        "signature": hmac.new(key, payload, hashlib.sha256).hexdigest(),
+    }
+    descriptor, name = tempfile.mkstemp(prefix="mina-mode-proof-", suffix=".json")
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(proof, handle, ensure_ascii=False, separators=(",", ":"))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(name, 0o600)
+        return Path(name)
+    except Exception:
+        if os.path.exists(name):
+            os.unlink(name)
+        raise
 
 
 def _mode_config(config: Mapping[str, Any] | None = None) -> Mapping[str, Any]:
@@ -75,6 +127,21 @@ def notify_rate_limit(
         return False
     model = str(getattr(agent, "model", "") or "").strip()
     reason_value = reason.value
+    key_path = Path(str(mode_config.get("identity_key_path") or "")).expanduser()
+    request = {
+        "provider": provider,
+        "available": False,
+        "reason": reason_value,
+        "evidence": f"hermes-classified:{reason_value}",
+        "model": model,
+        "retry_after_seconds": None,
+        "recovery_probe": None,
+    }
+    try:
+        proof_path = _write_identity_proof(key_path, request)
+    except Exception as exc:
+        logger.warning("TheWon model-mode identity proof unavailable: %s", exc)
+        return False
     command = [
         sys.executable,
         str(controller),
@@ -83,8 +150,8 @@ def notify_rate_limit(
         provider,
         "--available",
         "no",
-        "--actor",
-        "hermes-rate-limit-bridge",
+        "--identity-proof",
+        str(proof_path),
         "--reason",
         reason_value,
         "--evidence",
@@ -103,6 +170,8 @@ def notify_rate_limit(
     except Exception as exc:
         logger.warning("TheWon model-mode notification failed: %s", exc)
         return False
+    finally:
+        proof_path.unlink(missing_ok=True)
     if completed.returncode != 0:
         stderr = str(completed.stderr or "").strip().splitlines()
         logger.warning(
